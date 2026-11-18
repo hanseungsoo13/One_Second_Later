@@ -31,16 +31,30 @@ def position(h,w,c,device):
     return torch.cat([a.sin(),a.cos(),b.sin(),b.cos()],1)[None]
 
 class Model(nn.Module):
-    def __init__(self,backbone,transformer=True,dim=256):
+    def __init__(self,backbone,transformer=True,dim=256,person_branch=False,crop_size=None):
         super().__init__(); self.backbone=backbone
+        if person_branch and not transformer: raise ValueError("Person branch requires the transformer")
+        self.person_projection=nn.Linear(backbone.channels,dim) if person_branch else None
         self.projection=nn.Sequential(nn.Conv2d(backbone.channels+4,dim,1),nn.GroupNorm(32,dim),nn.GELU())
         self.transformer=nn.TransformerEncoder(nn.TransformerEncoderLayer(dim,8,1024,.1,batch_first=True,norm_first=True),2,enable_nested_tensor=False) if transformer else None
         self.decoder=nn.Sequential(nn.Conv2d(dim,128,3,padding=1),nn.GroupNorm(32,128),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(128,64,3,padding=1),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(64,32,3,padding=1),nn.GELU(),nn.Conv2d(32,1,1))
-    def forward(self,image,bbox):
+    def forward(self,image,bbox,person_crop=None):
         f=self.backbone(image); b,c,h,w=f.shape
         f=self.projection(torch.cat((f,spatial_prompt(bbox,h,w,image.shape[-2:])),1))
         if self.transformer is not None:
-            f=self.transformer(f.flatten(2).transpose(1,2)+position(h,w,f.shape[1],f.device)).transpose(1,2).reshape(b,-1,h,w)
+            pos=position(h,w,f.shape[1],f.device)
+            tokens=f.flatten(2).transpose(1,2)+pos
+            if self.person_projection is not None:
+                if person_crop is None: raise ValueError('person_crop is required for the person branch')
+                person=self.person_projection(self.backbone(person_crop).mean(dim=(2,3)))
+                ih,iw=image.shape[-2:]
+                px=(((bbox[:,0]+bbox[:,2])/2)*w/iw).long().clamp(0,w-1)
+                py=(bbox[:,3]*h/ih).long().clamp(0,h-1)
+                person=person+pos[0,py*w+px]
+                tokens=torch.cat((person[:,None,:],tokens),dim=1)
+            tokens=self.transformer(tokens)
+            if self.person_projection is not None: tokens=tokens[:,1:]
+            f=tokens.transpose(1,2).reshape(b,-1,h,w)
         return self.decoder(f)
 
 def heatmap_loss(logits,target,image_size,sigma):

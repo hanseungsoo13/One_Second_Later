@@ -16,6 +16,26 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(logits.shape,(1,1,16,16))
         loss=heatmap_loss(logits,torch.tensor([[32.,48.]]),(64,64),2.5); loss.backward()
         self.assertTrue(torch.isfinite(loss)); self.assertIsNotNone(logits.grad_fn)
+    def test_person_branch_outputs_and_trainable_gradient(self):
+        model=Model(Backbone(),True,person_branch=True,crop_size=(64,64))
+        image=torch.randn(1,3,64,64); crop=torch.randn(1,3,64,64); box=torch.tensor([[16.,16.,48.,48.]])
+        logits=model(image,box,crop)
+        self.assertEqual(logits.shape,(1,1,16,16))
+        heatmap_loss(logits,torch.tensor([[32.,48.]]),(64,64),2.5).backward()
+        self.assertIsNotNone(model.person_projection.weight.grad)
+    def test_person_crop_changes_prediction(self):
+        class SensitiveBackbone(nn.Module):
+            channels=8
+            def forward(self,x): return x.mean(dim=1,keepdim=True).repeat(1,8,1,1)[:,:,::16,::16]
+        torch.manual_seed(42)
+        model=Model(SensitiveBackbone(),True,person_branch=True,crop_size=(64,64)).eval()
+        image=torch.zeros(1,3,64,64); box=torch.tensor([[16.,16.,48.,48.]])
+        with torch.no_grad():
+            a=model(image,box,torch.zeros_like(image)); b=model(image,box,torch.ones_like(image))
+        self.assertFalse(torch.allclose(a,b))
+    def test_person_branch_requires_crop(self):
+        model=Model(Backbone(),True,person_branch=True,crop_size=(64,64))
+        with self.assertRaises(ValueError): model(torch.zeros(1,3,64,64),torch.tensor([[1.,1.,20.,30.]]))
     def test_coordinate_centers(self):
         x=torch.full((1,1,2,4),-100.); x[0,0,1,2]=100
         arg,expected,p=predictions(x,(20,40)); self.assertTrue(torch.allclose(arg,torch.tensor([[25.,15.]]))); self.assertTrue(torch.allclose(arg,expected)); self.assertAlmostEqual(p.sum().item(),1.)

@@ -13,6 +13,15 @@ class AnnotationTests(unittest.TestCase):
             ds=AnnotationDataset(root,[seq.name],'val',size=(64,64))
             self.assertEqual(len(ds),1); item=ds[0]
             self.assertEqual(item['original_target'].tolist(),[50,40]); self.assertAlmostEqual(item['target'][0].item(),32); self.assertAlmostEqual(item['target'][1].item(),41.6,places=4)
+    def test_person_crop_uses_original_image_pixels(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); seq=root/'MOT17-02-FRCNN'; seq.mkdir(); image=root/'frame.png'
+            im=Image.new('RGB',(100,50)); im.putpixel((50,25),(255,0,0)); im.save(image)
+            record={'sequence':seq.name,'person_id':1,'frame':1,'image_path':str(image),'image_size':[100,50],'bbox_xywh':[49,24,2,2],'target_bottom_center_xy':[50,30]}
+            (seq/'train.jsonl').write_text(json.dumps(record)+'\n')
+            ds=AnnotationDataset(root,[seq.name],'train',size=(16,16),person_crop={'size':[32,32],'scale':2})
+            self.assertEqual(ds[0]['person_crop'].shape,(3,32,32))
+            self.assertGreater(ds[0]['person_crop'][0].max().item(),1.)
     def test_outside_target_is_clipped_only_for_heatmap(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); seq=root/'MOT17-02-FRCNN'; seq.mkdir(); image=root/'frame.jpg'; Image.new('RGB',(100,50)).save(image)

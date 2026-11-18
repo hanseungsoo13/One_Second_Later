@@ -1,6 +1,6 @@
 # One Second Later
 
-Single-image pedestrian future localization with a frozen DINOv3 encoder. E0 predicts the current foot point; E2-A uses spatial conditioning and a convolutional decoder; E2-B adds two self-attention layers. Only the current image and bounding box are model inputs.
+Single-image pedestrian future localization with a frozen DINOv3 encoder. E0 predicts the current foot point; E2-A uses spatial conditioning and a convolutional decoder; E2-B adds two self-attention layers. E2-C additionally encodes a 2× person/context crop from the original image with the same frozen DINOv3 backbone, pools its patch features, and appends a projected person token to the scene transformer. The token carries the foot-point positional encoding; the box spatial maps and decoder are unchanged. The crop is aspect-preserving letterboxed to 224×224 and can include black padding outside the image. Only the current image and bounding box are model inputs.
 
 ## Data
 
@@ -31,8 +31,12 @@ $PY run.py overfit --config configs/e2a.yaml --steps 100
 $PY run.py overfit --config configs/e2b.yaml --steps 100
 $PY run.py train --config configs/e2a.yaml
 $PY run.py train --config configs/e2b.yaml
+$PY run.py overfit --config configs/e2c.yaml --steps 100
+$PY run.py train --config configs/e2c.yaml
 $PY run.py eval --config configs/e2b.yaml --checkpoint outputs/annotations-e2b/best.pt
 $PY run.py visualize --config configs/e2b.yaml --checkpoint outputs/annotations-e2b/best.pt
 ```
+
+E2-C uses the same annotation split, loss, decoder and optimizer settings as E2-B; crop size, context scale and output path are configurable in `configs/e2c.yaml`. Compare their respective validation metrics only after the runs complete.
 
 Select a GPU with `CUDA_VISIBLE_DEVICES`. Training saves the lowest validation argmax pixel FDE as `best.pt`, and reports per-sequence and overall metrics. Choose a new output path in YAML for each training run. Letterbox applies the same transformation to the image, box and target. Visualizations show the box (green), current foot (cyan), original GT foot (yellow), argmax (red), and heatmap (red overlay). Points outside the image may not be visible.

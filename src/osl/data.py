@@ -1,5 +1,6 @@
 """Load the supplied per-sequence JSONL annotations without re-splitting."""
 import json
+import math
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -7,10 +8,11 @@ import torch
 from torch.utils.data import Dataset
 
 class AnnotationDataset(Dataset):
-    def __init__(self, root, sequences, split, size=(384, 640)):
+    def __init__(self, root, sequences, split, size=(384, 640), person_crop=None):
         if split not in ('train', 'val'):
             raise ValueError(f'Invalid split: {split}')
         self.size = size
+        self.person_crop = person_crop
         self.records = []
         for sequence in sequences:
             path = Path(root) / sequence / f'{split}.jsonl'
@@ -33,6 +35,20 @@ class AnnotationDataset(Dataset):
         px, py = (ow - nw) // 2, (oh - nh) // 2; sx, sy = nw / w, nh / h
         image = Image.open(record['image_path']).convert('RGB')
         if image.size != (w, h): raise ValueError(f'Image size mismatch: {record["image_path"]}')
+        person_tensor = None
+        if self.person_crop is not None:
+            x, y, bw, bh = record['bbox_xywh']; factor = self.person_crop['scale']
+            cx, cy = x + bw / 2, y + bh / 2
+            left, top = math.floor(cx-bw*factor/2), math.floor(cy-bh*factor/2)
+            right, bottom = math.ceil(cx+bw*factor/2), math.ceil(cy+bh*factor/2)
+            crop = image.crop((left, top, right, bottom))
+            ch, cw = self.person_crop['size']; ratio = min(cw/crop.width, ch/crop.height)
+            rw, rh = max(1, round(crop.width*ratio)), max(1, round(crop.height*ratio))
+            crop = crop.resize((rw, rh), Image.Resampling.BILINEAR)
+            crop_canvas = Image.new('RGB', (cw, ch)); crop_canvas.paste(crop, ((cw-rw)//2, (ch-rh)//2))
+            person = np.asarray(crop_canvas, dtype=np.float32) / 255
+            person = (person - np.array([.485, .456, .406], np.float32)) / np.array([.229, .224, .225], np.float32)
+            person_tensor = torch.from_numpy(person.transpose(2, 0, 1).copy())
         image = image.resize((nw, nh), Image.Resampling.BILINEAR)
         canvas = Image.new('RGB', (ow, oh)); canvas.paste(image, (px, py))
         a = np.asarray(canvas, dtype=np.float32) / 255
@@ -41,7 +57,7 @@ class AnnotationDataset(Dataset):
         # The image heatmap cannot represent a point outside the image: train and
         # NLL at its nearest image boundary, but retain the true point for FDE.
         clipped_x = min(max(tx, 0), w - 1); clipped_y = min(max(ty, 0), h - 1)
-        return {'image': torch.from_numpy(a.transpose(2, 0, 1).copy()),
+        result = {'image': torch.from_numpy(a.transpose(2, 0, 1).copy()),
                 'bbox': torch.tensor([x*sx+px, y*sy+py, (x+bw)*sx+px, (y+bh)*sy+py]),
                 'target': torch.tensor([clipped_x*sx+px, clipped_y*sy+py]),
                 'original_target': torch.tensor([tx, ty]),
@@ -50,3 +66,5 @@ class AnnotationDataset(Dataset):
                 'sequence': record['sequence'], 'frame': record['frame'],
                 'person': record['person_id'], 'path': record['image_path'],
                 'mid': torch.tensor([float('nan'), float('nan')])}
+        if person_tensor is not None: result['person_crop'] = person_tensor
+        return result
