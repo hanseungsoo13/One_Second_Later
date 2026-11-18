@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
-from osl.data import MOT17Dataset
+from osl.data import AnnotationDataset
 from osl.model import DinoBackbone, Model, heatmap_loss
 from osl.evaluate import Metrics
 
@@ -13,15 +13,14 @@ def device_batch(b,device): return {k:v.to(device) if isinstance(v,torch.Tensor)
 def main():
     p=argparse.ArgumentParser(); p.add_argument('action',choices=['train','eval','e0','overfit','visualize']); p.add_argument('--config',required=True); p.add_argument('--checkpoint'); p.add_argument('--steps',type=int,default=100); args=p.parse_args()
     cfg=yaml.safe_load(Path(args.config).read_text()); d=cfg['data']; t=cfg['training']; m=cfg['model']
-    if set(d['train']) & set(d['val']): raise ValueError('Train and validation sequences must be disjoint')
     fixed={'02','04','09'}; moving={'05','10','11','13'}
     for split in ('train','val'):
         kinds={name.split('-')[1] for name in d[split] if name.startswith('MOT17-')}
         if kinds & fixed and kinds & moving: raise ValueError('Fixed and moving camera sequences must be evaluated separately')
     random.seed(t['seed']); np.random.seed(t['seed']); torch.manual_seed(t['seed']); torch.cuda.manual_seed_all(t['seed'])
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); torch.backends.cudnn.benchmark=False
-    def dataset(names): return MOT17Dataset(d['root'],names,d['size'],d['sample_fps'],d['min_visibility'])
-    val=dataset(d['val']); val.records=val.records[:d.get('max_val_samples',len(val))]; print('validation samples:',len(val),flush=True)
+    def dataset(names,split): return AnnotationDataset(d['root'],names,split,d['size'])
+    val=dataset(d['val'],'val'); val.records=val.records[:d.get('max_val_samples',len(val))]; print('validation samples:',len(val),flush=True)
     val_loader=DataLoader(val,batch_size=t['batch_size'],num_workers=t['workers'])
     if args.action=='e0':
         metrics=Metrics()
@@ -53,7 +52,7 @@ def main():
     if args.action=='visualize':
         from osl.visualize import save_examples
         print(json.dumps(save_examples(model,val_loader,device,output/'visualizations'),indent=2)); return
-    train=dataset(d['train']); train.records=train.records[:d.get('max_train_samples',len(train))]; print('train samples:',len(train),flush=True)
+    train=dataset(d['train'],'train'); train.records=train.records[:d.get('max_train_samples',len(train))]; print('train samples:',len(train),flush=True)
     loader=DataLoader(train,batch_size=t['batch_size'],shuffle=True,num_workers=t['workers'],generator=torch.Generator().manual_seed(t['seed']))
     if args.action=='overfit':
         batch=device_batch(next(iter(loader)),device); initial=None

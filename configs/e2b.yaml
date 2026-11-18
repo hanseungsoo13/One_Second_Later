@@ -1,9 +1,7 @@
 data:
-  root: /root/dataset/PersonSearch/MOT17/MOT17/train
-  train: [MOT17-02-FRCNN, MOT17-04-FRCNN]
-  val: [MOT17-09-FRCNN]
-  sample_fps: 2
-  min_visibility: 0.0
+  root: ../MOT17_prediction
+  train: [MOT17-02-FRCNN, MOT17-04-FRCNN, MOT17-09-FRCNN]
+  val: [MOT17-02-FRCNN, MOT17-04-FRCNN, MOT17-09-FRCNN]
   size: [384, 640]
 model:
   variant: e2b
@@ -19,7 +17,7 @@ training:
   weight_decay: 0.01
   warmup_epochs: 3
   sigma: 2.5
-  output: outputs/e2b
+  output: outputs/annotations-e2b
 wandb:
   enabled: true
   mode: offline
