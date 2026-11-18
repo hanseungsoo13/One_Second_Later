@@ -1,0 +1,27 @@
+data:
+  root: /root/dataset/PersonSearch/MOT17/MOT17/train
+  train: [MOT17-02-FRCNN, MOT17-04-FRCNN]
+  val: [MOT17-09-FRCNN]
+  sample_fps: 2
+  min_visibility: 0.0
+  size: [384, 640]
+model:
+  variant: e2a
+  repo: external/dinov3
+  weights: /root/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  name: dinov3_vitb16
+training:
+  seed: 42
+  batch_size: 4
+  workers: 4
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.01
+  warmup_epochs: 3
+  sigma: 2.5
+  output: outputs/e2a
+wandb:
+  enabled: true
+  mode: offline
+  entity: hanseungsoo-unist
+  project: One_Second_Later
