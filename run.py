@@ -21,7 +21,7 @@ def main():
         if kinds & fixed and kinds & moving: raise ValueError('Fixed and moving camera sequences must be evaluated separately')
     random.seed(t['seed']); np.random.seed(t['seed']); torch.manual_seed(t['seed']); torch.cuda.manual_seed_all(t['seed'])
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); torch.backends.cudnn.benchmark=False
-    def dataset(names,split): return AnnotationDataset(d['root'],names,split,d['size'],m.get('person_crop'))
+    def dataset(names,split): return AnnotationDataset(d['root'],names,split,d['size'],m.get('person_crop'),d.get('train_sample_fps') if split=='train' else None)
     val=dataset(d['val'],'val'); val.records=val.records[:d.get('max_val_samples',len(val))]; print('validation samples:',len(val),flush=True)
     val_loader=DataLoader(val,batch_size=t['batch_size'],num_workers=t['workers'])
     if args.action=='e0':

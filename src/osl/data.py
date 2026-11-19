@@ -8,9 +8,11 @@ import torch
 from torch.utils.data import Dataset
 
 class AnnotationDataset(Dataset):
-    def __init__(self, root, sequences, split, size=(384, 640), person_crop=None):
+    def __init__(self, root, sequences, split, size=(384, 640), person_crop=None, sample_fps=None):
         if split not in ('train', 'val'):
             raise ValueError(f'Invalid split: {split}')
+        if sample_fps is not None and (split != 'train' or sample_fps <= 0):
+            raise ValueError('sample_fps must be positive and applies only to training')
         self.size = size
         self.person_crop = person_crop
         self.records = []
@@ -22,6 +24,14 @@ class AnnotationDataset(Dataset):
                     record = json.loads(line)
                     if record['sequence'] != sequence:
                         raise ValueError(f'{path}:{line_number}: unexpected sequence')
+                    if sample_fps is not None:
+                        seconds = record['time_delta_seconds']
+                        fps = (record['target_frame'] - record['frame']) / seconds if seconds > 0 else 0
+                        if fps < sample_fps:
+                            raise ValueError(f'{path}:{line_number}: invalid time delta or sample FPS exceeds source FPS')
+                        frame = record['frame']
+                        if math.floor((frame - 1) * sample_fps / fps) == math.floor((frame - 2) * sample_fps / fps):
+                            continue
                     self.records.append(record)
         if not self.records:
             raise ValueError(f'No records in {split} annotations')

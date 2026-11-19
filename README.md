@@ -40,3 +40,11 @@ $PY run.py visualize --config configs/e2b.yaml --checkpoint outputs/annotations-
 E2-C uses the same annotation split, loss, decoder and optimizer settings as E2-B; crop size, context scale and output path are configurable in `configs/e2c.yaml`. Compare their respective validation metrics only after the runs complete.
 
 Select a GPU with `CUDA_VISIBLE_DEVICES`. Training saves the lowest validation argmax pixel FDE as `best.pt`, and reports per-sequence and overall metrics. Choose a new output path in YAML for each training run. Letterbox applies the same transformation to the image, box and target. Visualizations show the box (green), current foot (cyan), original GT foot (yellow), argmax (red), and heatmap (red overlay). Points outside the image may not be visible.
+
+## E2-C 2 FPS ablation
+
+`configs/e2c_2fps.yaml` selects training start frames approximately 2 FPS from the same JSONL records, using FPS inferred from the annotated frame gap and time delta. All people at a selected frame are kept. Validation still uses all 11,999 original validation records; no annotation files are changed. All model and optimization settings are identical to `e2c.yaml`, except the separate output directory and training sample rate. Since epochs contain fewer training examples, 50 epochs also means fewer optimizer updates; comparisons must account for this difference.
+
+```bash
+$PY run.py train --config configs/e2c_2fps.yaml
+```

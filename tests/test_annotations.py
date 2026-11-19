@@ -13,6 +13,19 @@ class AnnotationTests(unittest.TestCase):
             ds=AnnotationDataset(root,[seq.name],'val',size=(64,64))
             self.assertEqual(len(ds),1); item=ds[0]
             self.assertEqual(item['original_target'].tolist(),[50,40]); self.assertAlmostEqual(item['target'][0].item(),32); self.assertAlmostEqual(item['target'][1].item(),41.6,places=4)
+    def test_frame_sampling_preserves_all_people_and_val(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); seq=root/'MOT17-02-FRCNN'; seq.mkdir()
+            records=[]
+            for frame in (1,2,15,16,31):
+                for person in (1,2):
+                    records.append({'sequence':seq.name,'person_id':person,'frame':frame,'target_frame':frame+30,'time_delta_seconds':1.0})
+            for split in ('train','val'):
+                (seq/f'{split}.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+            train=AnnotationDataset(root,[seq.name],'train',sample_fps=2)
+            val=AnnotationDataset(root,[seq.name],'val')
+            self.assertEqual([r['frame'] for r in train.records], [1,1,16,16,31,31])
+            self.assertEqual(len(val),10)
     def test_person_crop_uses_original_image_pixels(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); seq=root/'MOT17-02-FRCNN'; seq.mkdir(); image=root/'frame.png'
