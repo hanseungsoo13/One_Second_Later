@@ -18,6 +18,35 @@ from PIL import Image
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / 'src'))
 
+
+def _install_memory_compatibility(regressor_module):
+    def memory_forward(self, inputs, targets, epoch=None):
+        return ModernMemoryLayer.apply(inputs, targets, self.mem, 0.5)
+
+    regressor_module.Memory.forward = memory_forward
+
+
+class ModernMemoryLayer(torch.autograd.Function):
+    """PyTorch 2-compatible form of CUCPS's memory update autograd function."""
+
+    @staticmethod
+    def forward(ctx, inputs, targets, memory, alpha):
+        ctx.memory = memory
+        ctx.alpha = float(alpha)
+        ctx.save_for_backward(inputs, targets)
+        return inputs.mm(memory.t())
+
+    @staticmethod
+    def backward(ctx, grad_outputs):
+        inputs, targets = ctx.saved_tensors
+        memory = ctx.memory
+        grad_inputs = grad_outputs.mm(memory) if ctx.needs_input_grad[0] else None
+        with torch.no_grad():
+            for feature, target in zip(inputs, targets):
+                memory[target] = ctx.alpha * memory[target] + (1.0 - ctx.alpha) * feature
+                memory[target] /= memory[target].norm()
+        return grad_inputs, None, None, None
+
 from osl.cucps_temporal import add_temporal_prior, next_frame_indices
 from osl.model import DinoBackbone, Model
 from osl.temporal_search import location_scores
@@ -69,6 +98,8 @@ def _load_cucps(cfg):
     # Replacing this factory keeps its dataset and loader behavior intact.
     datasets.get_dataset = configured_dataset
     from lib.model.faster_rcnn import get_model
+    import lib.model.reID.regressor as regressor_module
+    _install_memory_compatibility(regressor_module)
     return datasets, get_model, paths
 
 
@@ -275,6 +306,14 @@ def _attach_temporal_prior(clustering, prior_rows, weight):
     clustering.hard_negative_mining = MethodType(temporal_hnm, clustering)
 
 
+def _resolve_device(value):
+    """Resolve CUDA's implicit device to the first visible GPU."""
+    device = torch.device(value)
+    if device.type == 'cuda' and device.index is None:
+        return torch.device('cuda', 0)
+    return device
+
+
 def train(cfg, variant):
     if variant not in ('baseline', 'temporal'):
         raise ValueError('variant must be baseline or temporal')
@@ -304,7 +343,7 @@ def train(cfg, variant):
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    device = torch.device(args.device)
+    device = _resolve_device(args.device)
     if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA was requested but is not available')
     if device.type == 'cuda':

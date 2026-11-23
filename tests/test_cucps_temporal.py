@@ -3,7 +3,39 @@ import unittest
 import torch
 
 from osl.cucps_temporal import add_temporal_prior, next_frame_indices
-from cucps_temporal_experiment import _attach_temporal_prior
+from cucps_temporal_experiment import (
+    _attach_temporal_prior, _resolve_device, _install_memory_compatibility,
+)
+
+
+class ModernMemoryLayerTests(unittest.TestCase):
+    def test_forward_backward_preserves_memory_update_and_input_gradient(self):
+        memory = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        inputs = torch.tensor([[0.6, 0.8]], requires_grad=True)
+        targets = torch.tensor([0])
+
+        class LegacyMemory:
+            pass
+
+        instance = LegacyMemory()
+        instance.mem = memory
+        _install_memory_compatibility(type('RegressorModule', (), {'Memory': LegacyMemory}))
+        instance.forward = LegacyMemory.forward.__get__(instance, LegacyMemory)
+        instance.forward(inputs, targets).sum().backward()
+
+        self.assertTrue(torch.allclose(inputs.grad, torch.tensor([[1.0, 1.0]])))
+        expected_memory = torch.tensor([[0.8, 0.4], [0.0, 1.0]])
+        expected_memory[0] /= expected_memory[0].norm()
+        self.assertTrue(torch.allclose(memory, expected_memory))
+
+
+class DeviceResolutionTests(unittest.TestCase):
+    def test_unindexed_cuda_resolves_to_visible_device_zero(self):
+        self.assertEqual(_resolve_device('cuda'), torch.device('cuda:0'))
+
+    def test_explicit_device_index_is_preserved(self):
+        self.assertEqual(_resolve_device('cuda:2'), torch.device('cuda:2'))
+        self.assertEqual(_resolve_device('cpu'), torch.device('cpu'))
 
 
 class AddTemporalPriorTests(unittest.TestCase):
