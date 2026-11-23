@@ -6,9 +6,10 @@ import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
+from .pose import load_cache, pose_key
 
 class AnnotationDataset(Dataset):
-    def __init__(self, root, sequences, split, size=(384, 640), person_crop=None, sample_fps=None):
+    def __init__(self, root, sequences, split, size=(384, 640), person_crop=None, sample_fps=None, pose_cache=None, shuffle_pose=False):
         if split not in ('train', 'val'):
             raise ValueError(f'Invalid split: {split}')
         if sample_fps is not None and (split != 'train' or sample_fps <= 0):
@@ -33,6 +34,13 @@ class AnnotationDataset(Dataset):
                         if math.floor((frame - 1) * sample_fps / fps) == math.floor((frame - 2) * sample_fps / fps):
                             continue
                     self.records.append(record)
+        self.poses = load_cache(pose_cache) if pose_cache else None
+        self.pose_keys = [pose_key(record) for record in self.records] if self.poses is not None else None
+        if self.pose_keys is not None:
+            missing = sum(key not in self.poses for key in self.pose_keys)
+            if missing: raise ValueError(f'Pose cache is missing {missing} records: {pose_cache}')
+            if shuffle_pose:
+                self.pose_keys = list(np.random.default_rng(42).permutation(self.pose_keys))
         if not self.records:
             raise ValueError(f'No records in {split} annotations')
 
@@ -77,4 +85,5 @@ class AnnotationDataset(Dataset):
                 'person': record['person_id'], 'path': record['image_path'],
                 'mid': torch.tensor([float('nan'), float('nan')])}
         if person_tensor is not None: result['person_crop'] = person_tensor
+        if self.poses is not None: result['pose'] = torch.from_numpy(self.poses[self.pose_keys[index]].copy())
         return result

@@ -3,3 +3,6 @@ Pillow
 PyYAML
 torch
 wandb
+
+# Offline RTMPose cache generation
+rtmlib==0.0.16

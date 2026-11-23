@@ -48,3 +48,42 @@ Select a GPU with `CUDA_VISIBLE_DEVICES`. Training saves the lowest validation a
 ```bash
 $PY run.py train --config configs/e2c_2fps.yaml
 ```
+
+## E2-C with pose
+
+`configs/e2c_p1.yaml` and `configs/e2c_p2.yaml` share the same frozen
+RTMPose-M cache and two-layer pose MLP. P1 appends pose and appearance as
+separate tokens; P2 adds gated projected pose to appearance before the scene
+transformer. Both tokens use the current foot-point position. DINOv3 remains
+shared and frozen. The RTMPose-M model is the rtmlib balanced COCO 17-joint
+model (192×256); the annotation box is passed directly to the top-down model.
+Its predicted image coordinates are normalized relative to the original box;
+coordinates can lie outside [0, 1], and each joint includes its confidence.
+
+Install `rtmlib==0.0.16` and an ONNX Runtime backend in `flypose` for cache
+generation. The default CPU inference downloads the official model on first
+use. Each cache is resumable and keyed by sequence, frame, person, image path,
+image size, and box. A missing or mismatched record fails instead of silently
+substituting a pose. Cache files and model weights are generated artifacts.
+Generate both splits once, then reuse them for both variants:
+
+```bash
+PY=/root/workplace/miniconda3/envs/flypose/bin/python
+$PY -m pip install rtmlib==0.0.16
+$PY cache_pose.py --config configs/e2c_p1.yaml --split train
+$PY cache_pose.py --config configs/e2c_p1.yaml --split val
+$PY run.py train --config configs/e2c_p1.yaml
+$PY run.py train --config configs/e2c_p2.yaml
+$PY run.py eval --config configs/e2c_p2.yaml --checkpoint outputs/annotations-e2c-p2/best.pt
+$PY run.py eval --config configs/e2c_p2.yaml --checkpoint outputs/annotations-e2c-p2/best.pt --shuffle-pose
+```
+
+Shuffling uses a fixed seed across the validation dataset, preserving each
+pose's joints and confidence together; compare against ordinary evaluation on
+the same checkpoint. Both configurations stop after eight epochs without
+improvement in overall validation argmax FDE, matching the existing checkpoint
+selection criterion. Metrics include movement thresholds, zero-motion FDE,
+improvement over zero-motion, and sequence breakdowns. The supplied split
+shares scenes between training and validation; configure separate sequence
+annotations and caches to measure unseen-scene generalization. Generating a
+cache and training full experiments are separate steps and may take time.

@@ -11,24 +11,27 @@ from osl.evaluate import Metrics
 
 def device_batch(b,device): return {k:v.to(device) if isinstance(v,torch.Tensor) else v for k,v in b.items()}
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('action',choices=['train','eval','e0','overfit','visualize']); p.add_argument('--config',required=True); p.add_argument('--checkpoint'); p.add_argument('--steps',type=int,default=100); args=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('action',choices=['train','eval','e0','overfit','visualize']); p.add_argument('--config',required=True); p.add_argument('--checkpoint'); p.add_argument('--steps',type=int,default=100); p.add_argument('--shuffle-pose',action='store_true',help='Deterministically shuffle validation poses'); args=p.parse_args()
     cfg=yaml.safe_load(Path(args.config).read_text()); d=cfg['data']; t=cfg['training']; m=cfg['model']
-    if m['variant'] not in ('e2a','e2b','e2c'): raise ValueError(f"Unknown model variant: {m['variant']}")
-    if m['variant']=='e2c' and not m.get('person_crop'): raise ValueError('E2-C requires model.person_crop configuration')
+    if m['variant'] not in ('e2a','e2b','e2c','e2c_p1','e2c_p2'): raise ValueError(f"Unknown model variant: {m['variant']}")
+    if m['variant'] in ('e2c','e2c_p1','e2c_p2') and not m.get('person_crop'): raise ValueError('E2-C requires model.person_crop configuration')
+    pose_enabled = m['variant'] in ('e2c_p1','e2c_p2')
+    if pose_enabled and not m.get('pose'): raise ValueError('Pose variants require model.pose configuration')
+    if args.shuffle_pose and (not pose_enabled or args.action != 'eval'): raise ValueError('--shuffle-pose requires pose evaluation')
     fixed={'02','04','09'}; moving={'05','10','11','13'}
     for split in ('train','val'):
         kinds={name.split('-')[1] for name in d[split] if name.startswith('MOT17-')}
         if kinds & fixed and kinds & moving: raise ValueError('Fixed and moving camera sequences must be evaluated separately')
     random.seed(t['seed']); np.random.seed(t['seed']); torch.manual_seed(t['seed']); torch.cuda.manual_seed_all(t['seed'])
     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); torch.backends.cudnn.benchmark=False
-    def dataset(names,split): return AnnotationDataset(d['root'],names,split,d['size'],m.get('person_crop'),d.get('train_sample_fps') if split=='train' else None)
+    def dataset(names,split): return AnnotationDataset(d['root'],names,split,d['size'],m.get('person_crop'),d.get('train_sample_fps') if split=='train' else None, m['pose']['cache'][split] if pose_enabled else None, args.shuffle_pose and split=='val')
     val=dataset(d['val'],'val'); val.records=val.records[:d.get('max_val_samples',len(val))]; print('validation samples:',len(val),flush=True)
     val_loader=DataLoader(val,batch_size=t['batch_size'],num_workers=t['workers'])
     if args.action=='e0':
         metrics=Metrics()
         for batch in val_loader: metrics.update(batch)
         print(json.dumps(metrics.result(),indent=2)); return
-    model=Model(DinoBackbone(m['repo'],m['weights'],m['name']),m['variant'] in ('e2b','e2c'),person_branch=m['variant']=='e2c').to(device)
+    model=Model(DinoBackbone(m['repo'],m['weights'],m['name']),m['variant'] in ('e2b','e2c','e2c_p1','e2c_p2'),person_branch=m['variant'] in ('e2c','e2c_p1','e2c_p2'),pose_fusion=m['variant'][-2:] if pose_enabled else None).to(device)
     if args.checkpoint: model.load_state_dict(torch.load(args.checkpoint,map_location=device,weights_only=False)['model'])
     if args.action in ('eval','visualize') and not args.checkpoint: raise ValueError('eval requires --checkpoint')
     optimizer=torch.optim.AdamW((x for x in model.parameters() if x.requires_grad),lr=t['lr'],weight_decay=t['weight_decay'])
@@ -47,7 +50,7 @@ def main():
         with torch.no_grad():
             for raw in val_loader:
                 b=device_batch(raw,device)
-                with torch.autocast(device_type=device.type,dtype=dtype,enabled=amp): logits=model(b['image'],b['bbox'],b.get('person_crop')); loss=heatmap_loss(logits,b['target'],b['image'].shape[-2:],t['sigma'])
+                with torch.autocast(device_type=device.type,dtype=dtype,enabled=amp): logits=model(b['image'],b['bbox'],b.get('person_crop'),b.get('pose')); loss=heatmap_loss(logits,b['target'],b['image'].shape[-2:],t['sigma'])
                 metrics.update(b,logits); total+=loss.item()*len(b['image']); n+=len(b['image'])
         return {'loss':total/n,**metrics.result()}
     if args.action=='eval': print(json.dumps(evaluate(),indent=2)); return
@@ -60,20 +63,20 @@ def main():
         batch=device_batch(next(iter(loader)),device); initial=None
         for step in range(args.steps):
             model.train(); optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type,dtype=dtype,enabled=amp): loss=heatmap_loss(model(batch['image'],batch['bbox'],batch.get('person_crop')),batch['target'],batch['image'].shape[-2:],t['sigma'])
+            with torch.autocast(device_type=device.type,dtype=dtype,enabled=amp): loss=heatmap_loss(model(batch['image'],batch['bbox'],batch.get('person_crop'),batch.get('pose')),batch['target'],batch['image'].shape[-2:],t['sigma'])
             scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
             if initial is None: initial=loss.item()
             if step%10==0 or step==args.steps-1: print(f'step {step}: {loss.item():.5f}',flush=True)
         if loss.item() >= initial: raise RuntimeError('Overfit test did not reduce loss')
         return
-    best=float('inf')
+    best=float('inf'); stale_epochs=0
     if t['warmup_epochs']:
         for group in optimizer.param_groups: group['lr']=t['lr']/t['warmup_epochs']
     for epoch in range(t['epochs']):
         model.train(); total=0.; n=0; train_metrics=Metrics()
         for raw in loader:
             b=device_batch(raw,device); optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type,dtype=dtype,enabled=amp): logits=model(b['image'],b['bbox'],b.get('person_crop')); loss=heatmap_loss(logits,b['target'],b['image'].shape[-2:],t['sigma'])
+            with torch.autocast(device_type=device.type,dtype=dtype,enabled=amp): logits=model(b['image'],b['bbox'],b.get('person_crop'),b.get('pose')); loss=heatmap_loss(logits,b['target'],b['image'].shape[-2:],t['sigma'])
             scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update(); total+=loss.item()*len(b['image']); n+=len(b['image']); train_metrics.update(b,logits.detach())
         metrics=evaluate(); metrics['train_loss']=total/n; metrics['epoch']=epoch+1; metrics.update({'train/'+k:v for k,v in train_metrics.result().items()})
         print(json.dumps(metrics),flush=True)
@@ -81,7 +84,11 @@ def main():
         if run: run.log(metrics,step=epoch+1)
         score=metrics['overall/moving_0/argmax_fde_px']
         if score<best:
-            best=score; torch.save({'model':model.state_dict(),'config':cfg,'epoch':epoch+1,'metrics':metrics},output/'best.pt')
+            best=score; stale_epochs=0; torch.save({'model':model.state_dict(),'config':cfg,'epoch':epoch+1,'metrics':metrics},output/'best.pt')
+        else:
+            stale_epochs += 1
+        if t.get('early_stopping_patience') and stale_epochs >= t['early_stopping_patience']:
+            print(f'Early stopping after {epoch+1} epochs', flush=True); break
         warm=t['warmup_epochs']; factor=(epoch+2)/warm if epoch+1<warm else .5*(1+math.cos(math.pi*(epoch+1-warm)/max(1,t['epochs']-warm)))
         for group in optimizer.param_groups: group['lr']=t['lr']*factor
     if run: run.finish()
