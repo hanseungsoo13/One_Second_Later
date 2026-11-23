@@ -30,15 +30,32 @@ def position(h,w,c,device):
     a=x.flatten()[:,None]*freq; b=y.flatten()[:,None]*freq
     return torch.cat([a.sin(),a.cos(),b.sin(),b.cos()],1)[None]
 
+class PoseEncoder(nn.Module):
+    """Encode 17 bounding-box-relative (x, y, confidence) keypoints."""
+    def __init__(self, dim=256):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(51, dim), nn.GELU(), nn.Linear(dim, dim))
+
+    def forward(self, keypoints):
+        if keypoints.ndim != 3 or keypoints.shape[1:] != (17, 3):
+            raise ValueError('pose must have shape [batch, 17, 3]')
+        return self.net(keypoints.flatten(1))
+
 class Model(nn.Module):
-    def __init__(self,backbone,transformer=True,dim=256,person_branch=False,crop_size=None):
+    def __init__(self,backbone,transformer=True,dim=256,person_branch=False,crop_size=None,pose_fusion=None):
         super().__init__(); self.backbone=backbone
         if person_branch and not transformer: raise ValueError("Person branch requires the transformer")
+        if pose_fusion not in (None, 'p1', 'p2'): raise ValueError('Invalid pose fusion')
+        if pose_fusion and not person_branch: raise ValueError('Pose requires the person branch')
+        self.pose_fusion = pose_fusion
+        self.pose_encoder = PoseEncoder(dim) if pose_fusion else None
+        self.pose_projection = nn.Linear(dim, dim) if pose_fusion == 'p2' else None
+        self.pose_gate = nn.Linear(2 * dim, dim) if pose_fusion == 'p2' else None
         self.person_projection=nn.Linear(backbone.channels,dim) if person_branch else None
         self.projection=nn.Sequential(nn.Conv2d(backbone.channels+4,dim,1),nn.GroupNorm(32,dim),nn.GELU())
         self.transformer=nn.TransformerEncoder(nn.TransformerEncoderLayer(dim,8,1024,.1,batch_first=True,norm_first=True),2,enable_nested_tensor=False) if transformer else None
         self.decoder=nn.Sequential(nn.Conv2d(dim,128,3,padding=1),nn.GroupNorm(32,128),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(128,64,3,padding=1),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(64,32,3,padding=1),nn.GELU(),nn.Conv2d(32,1,1))
-    def forward(self,image,bbox,person_crop=None):
+    def forward(self,image,bbox,person_crop=None,pose=None):
         f=self.backbone(image); b,c,h,w=f.shape
         f=self.projection(torch.cat((f,spatial_prompt(bbox,h,w,image.shape[-2:])),1))
         if self.transformer is not None:
@@ -47,13 +64,21 @@ class Model(nn.Module):
             if self.person_projection is not None:
                 if person_crop is None: raise ValueError('person_crop is required for the person branch')
                 person=self.person_projection(self.backbone(person_crop).mean(dim=(2,3)))
+                if self.pose_encoder is not None:
+                    if pose is None: raise ValueError('pose is required for the pose branch')
+                    pose_token = self.pose_encoder(pose)
+                    if self.pose_fusion == 'p2':
+                        gate = torch.sigmoid(self.pose_gate(torch.cat((person, pose_token), dim=1)))
+                        person = person + gate * self.pose_projection(pose_token)
                 ih,iw=image.shape[-2:]
                 px=(((bbox[:,0]+bbox[:,2])/2)*w/iw).long().clamp(0,w-1)
                 py=(bbox[:,3]*h/ih).long().clamp(0,h-1)
                 person=person+pos[0,py*w+px]
                 tokens=torch.cat((person[:,None,:],tokens),dim=1)
+                if self.pose_fusion == 'p1':
+                    tokens=torch.cat(((pose_token+pos[0,py*w+px])[:,None,:],tokens),dim=1)
             tokens=self.transformer(tokens)
-            if self.person_projection is not None: tokens=tokens[:,1:]
+            if self.person_projection is not None: tokens=tokens[:,2 if self.pose_fusion == 'p1' else 1:]
             f=tokens.transpose(1,2).reshape(b,-1,h,w)
         return self.decoder(f)
 
