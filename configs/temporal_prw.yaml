@@ -1,0 +1,30 @@
+prw_root: /root/dataset/PersonSearch/PRW-v16.04.20
+pairs_root: ../PRW_temporal_search/pairs
+output_root: ../PRW_temporal_search/results_20261123
+prepare:
+  train_fraction: 0.8
+  annotation_workers: 8
+cucps:
+  repo: external/CUCPS_official
+  args: external/weights/cucps_prw/args.json
+  checkpoint: external/weights/cucps_prw/checkpoint_epoch18.pth
+  candidate_mode: detected
+  detection_threshold: 0.9
+  iou_threshold: 0.5
+motion:
+  repo: external/dinov3
+  weights: /root/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  name: dinov3_vitb16
+  checkpoint: outputs/personpath22-ground-view-e2c-20261119-01/best.pt
+  size: [384, 640]
+  person_crop:
+    size: [224, 224]
+    scale: 2.0
+  heatmap_radius_cells: 1
+runtime:
+  device: cuda
+fit:
+  epochs: 20
+  learning_rate: 0.03
+  temperature: 0.1
+  seed: 42

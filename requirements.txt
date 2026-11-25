@@ -6,3 +6,10 @@ wandb
 
 # Offline RTMPose cache generation
 rtmlib==0.0.16
+
+# PRW full-gallery person-search evaluation
+scipy
+scikit-learn
+torchvision
+opencv-python
+huepy
