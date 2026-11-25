@@ -100,3 +100,15 @@ OSL은 **CUCPS 학습 중에만** 보조 단서로 사용됩니다. 저장된 CU
 ## 기존 체크포인트에 대한 주의
 
 이전 PRW 실험에서 사용한 `outputs/pose-runs/20261123-0228/p2/best.pt`에는 학습 데이터가 `../MOT17_prediction`으로 기록돼 있습니다. 따라서 이 체크포인트를 PersonPath22에서 학습한 OSL로 간주하면 안 됩니다. `configs/cucps_temporal_prw_pose_p2.yaml`은 기본적으로 이 기존 체크포인트를 가리킵니다. PersonPath22에서 학습한 OSL을 쓰려면 위처럼 `motion.pose_checkpoint`를 변경해야 합니다.
+
+## 3. OSL + 장면 분할 학습
+
+`configs/personpath22_osl_s.yaml`은 OSL에 SegFormer-B2의 150개 장면 분할 확률 특징을 추가합니다. 1번 단계의 같은 PersonPath22 데이터와 pose 캐시를 사용하며, SegFormer는 학습 전 이미지별 semantic 캐시를 생성할 때만 사용합니다. 첫 실행에는 Hugging Face의 모델 가중치 다운로드가 필요합니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=8 python cache_semantic.py --config configs/personpath22_osl_s.yaml --split train
+CUDA_VISIBLE_DEVICES=8 python cache_semantic.py --config configs/personpath22_osl_s.yaml --split val
+CUDA_VISIBLE_DEVICES=8 python run.py train --config configs/personpath22_osl_s.yaml
+```
+
+pose 및 semantic train/val 캐시가 모두 준비돼 있어야 학습할 수 있습니다. Semantic 캐시는 이미지별로 저장되며 재실행 시 기존 항목을 재사용합니다. 출력은 `outputs/personpath22-osl-s/run-01`에 저장됩니다. 데이터와 가중치 경로 및 GPU 번호는 환경에 맞게 변경하세요.

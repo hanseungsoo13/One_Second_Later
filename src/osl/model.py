@@ -42,7 +42,7 @@ class PoseEncoder(nn.Module):
         return self.net(keypoints.flatten(1))
 
 class Model(nn.Module):
-    def __init__(self,backbone,transformer=True,dim=256,person_branch=False,crop_size=None,pose_fusion=None):
+    def __init__(self,backbone,transformer=True,dim=256,person_branch=False,crop_size=None,pose_fusion=None,semantic_channels=None):
         super().__init__(); self.backbone=backbone
         if person_branch and not transformer: raise ValueError("Person branch requires the transformer")
         if pose_fusion not in (None, 'p1', 'p2'): raise ValueError('Invalid pose fusion')
@@ -51,13 +51,21 @@ class Model(nn.Module):
         self.pose_encoder = PoseEncoder(dim) if pose_fusion else None
         self.pose_projection = nn.Linear(dim, dim) if pose_fusion == 'p2' else None
         self.pose_gate = nn.Linear(2 * dim, dim) if pose_fusion == 'p2' else None
+        self.semantic_projection = nn.Conv2d(semantic_channels, 64, 1) if semantic_channels else None
         self.person_projection=nn.Linear(backbone.channels,dim) if person_branch else None
-        self.projection=nn.Sequential(nn.Conv2d(backbone.channels+4,dim,1),nn.GroupNorm(32,dim),nn.GELU())
+        self.projection=nn.Sequential(nn.Conv2d(backbone.channels+4+(64 if semantic_channels else 0),dim,1),nn.GroupNorm(32,dim),nn.GELU())
         self.transformer=nn.TransformerEncoder(nn.TransformerEncoderLayer(dim,8,1024,.1,batch_first=True,norm_first=True),2,enable_nested_tensor=False) if transformer else None
         self.decoder=nn.Sequential(nn.Conv2d(dim,128,3,padding=1),nn.GroupNorm(32,128),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(128,64,3,padding=1),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(64,32,3,padding=1),nn.GELU(),nn.Conv2d(32,1,1))
-    def forward(self,image,bbox,person_crop=None,pose=None):
+    def forward(self,image,bbox,person_crop=None,pose=None,semantic=None):
         f=self.backbone(image); b,c,h,w=f.shape
-        f=self.projection(torch.cat((f,spatial_prompt(bbox,h,w,image.shape[-2:])),1))
+        parts = [f]
+        if self.semantic_projection is not None:
+            if semantic is None: raise ValueError('semantic is required for the semantic branch')
+            if semantic.ndim != 4 or semantic.shape[0] != b or semantic.shape[1] != self.semantic_projection.in_channels or semantic.shape[-2:] != (h,w):
+                raise ValueError('semantic probabilities must match the scene grid')
+            parts.append(self.semantic_projection(semantic))
+        parts.append(spatial_prompt(bbox,h,w,image.shape[-2:]))
+        f=self.projection(torch.cat(parts,1))
         if self.transformer is not None:
             pos=position(h,w,f.shape[1],f.device)
             tokens=f.flatten(2).transpose(1,2)+pos

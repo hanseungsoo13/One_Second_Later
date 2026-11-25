@@ -7,9 +7,10 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from .pose import load_cache, pose_key
+from .segmentation import SegmentationCache, image_key
 
 class AnnotationDataset(Dataset):
-    def __init__(self, root, sequences, split, size=(384, 640), person_crop=None, sample_fps=None, pose_cache=None, shuffle_pose=False):
+    def __init__(self, root, sequences, split, size=(384, 640), person_crop=None, sample_fps=None, pose_cache=None, shuffle_pose=False, semantic_cache=None, semantic_metadata=None):
         if split not in ('train', 'val'):
             raise ValueError(f'Invalid split: {split}')
         if sample_fps is not None and (split != 'train' or sample_fps <= 0):
@@ -41,6 +42,15 @@ class AnnotationDataset(Dataset):
             if missing: raise ValueError(f'Pose cache is missing {missing} records: {pose_cache}')
             if shuffle_pose:
                 self.pose_keys = list(np.random.default_rng(42).permutation(self.pose_keys))
+        self.semantic_cache = semantic_cache
+        self.semantic_metadata = semantic_metadata
+        self._semantic_reader = None
+        self._semantic_pid = None
+        if semantic_cache:
+            cache = SegmentationCache(semantic_cache, semantic_metadata)
+            missing = {image_key(record) for record in self.records} - cache.keys()
+            cache.close()
+            if missing: raise ValueError(f'Semantic cache missing {len(missing)} images: {semantic_cache}')
         if not self.records:
             raise ValueError(f'No records in {split} annotations')
 
@@ -85,5 +95,11 @@ class AnnotationDataset(Dataset):
                 'person': record['person_id'], 'path': record['image_path'],
                 'mid': torch.tensor([float('nan'), float('nan')])}
         if person_tensor is not None: result['person_crop'] = person_tensor
+        if self.semantic_cache:
+            import os
+            if self._semantic_pid != os.getpid():
+                self._semantic_reader = SegmentationCache(self.semantic_cache, self.semantic_metadata)
+                self._semantic_pid = os.getpid()
+            result['semantic'] = torch.from_numpy(self._semantic_reader.get(image_key(record)))
         if self.poses is not None: result['pose'] = torch.from_numpy(self.poses[self.pose_keys[index]].copy())
         return result

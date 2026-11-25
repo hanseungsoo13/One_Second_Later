@@ -12,7 +12,7 @@ def save_examples(model, loader, device, output):
     with torch.no_grad():
         for raw in loader:
             b={k:v.to(device) if isinstance(v,torch.Tensor) else v for k,v in raw.items()}
-            logits=model(b['image'],b['bbox'],b.get('person_crop'),b.get('pose')); arg,_,p=predictions(logits,b['image'].shape[-2:]); arg=(arg-b['offset'])/b['scale']
+            logits=model(b['image'],b['bbox'],b.get('person_crop'),b.get('pose'),b.get('semantic')); arg,_,p=predictions(logits,b['image'].shape[-2:]); arg=(arg-b['offset'])/b['scale']
             for i in range(len(arg)):
                 current=b['original_foot'][i]; target=b['original_target'][i]; mid=b['mid'][i]; height=b['height'][i].clamp_min(1)
                 motion=float((target-current).norm()/height); error=float((arg[i]-target).norm()/height)

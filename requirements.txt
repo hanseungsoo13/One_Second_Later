@@ -13,3 +13,6 @@ scikit-learn
 torchvision
 opencv-python
 huepy
+
+# Offline semantic cache generation
+transformers==4.48.3
