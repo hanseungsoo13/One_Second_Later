@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 
 from osl.cucps_temporal import add_temporal_prior, next_frame_indices
-from cucps_temporal_experiment import (
+from cucps.experiment import (
     _attach_temporal_prior, _resolve_device, _install_memory_compatibility,
     _load_prw_probes_utf8, _install_numpy_detection_compatibility,
     _predict_relative_poses,
@@ -151,3 +151,108 @@ class AddTemporalPriorTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class NamedMotionModelTests(unittest.TestCase):
+    def test_model_factory_respects_full_bbox_a_architecture(self):
+        from unittest.mock import patch, MagicMock
+        from cucps import experiment
+        model = MagicMock()
+        model.to.return_value = model
+        paths = {('motion', 'repo'): 'repo', ('motion', 'weights'): 'weights',
+                 ('motion', 'checkpoint'): 'checkpoint'}
+        cfg = {'motion': {'name': 'backbone'}}
+        with patch.object(experiment, 'DinoBackbone'), patch.object(experiment, 'Model', return_value=model) as factory, \
+             patch.object(experiment.torch, 'load', return_value={'model': {}}):
+            experiment._motion_model(cfg, torch.device('cpu'), paths, 'full_bbox_a')
+        self.assertFalse(factory.call_args.kwargs['transformer'])
+        self.assertFalse(factory.call_args.kwargs['person_branch'])
+
+    def test_model_factory_enables_pose_and_semantic_channels(self):
+        from unittest.mock import patch, MagicMock
+        from cucps import experiment
+        model = MagicMock()
+        model.to.return_value = model
+        paths = {('motion', 'repo'): 'repo', ('motion', 'weights'): 'weights',
+                 ('motion', 'pose_checkpoint'): 'pose-checkpoint'}
+        with patch.object(experiment, 'DinoBackbone'), patch.object(experiment, 'Model', return_value=model) as factory, \
+             patch.object(experiment.torch, 'load', return_value={'model': {}}) as load:
+            experiment._motion_model({'motion': {'name': 'backbone'}}, torch.device('cpu'), paths, 'full_bbox_pose_seg')
+        self.assertEqual(factory.call_args.kwargs['pose_fusion'], 'p2')
+        self.assertEqual(factory.call_args.kwargs['semantic_channels'], 150)
+        self.assertEqual(load.call_args.args[0], 'pose-checkpoint')
+
+class ComparisonNameTests(unittest.TestCase):
+    def test_old_and_new_model_names_compare_as_aliases(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from cucps import experiment
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {}
+            for name, stored in [('baseline', 'baseline'), ('full_bbox_pose2', 'pose_p2')]:
+                directory = root / name
+                directory.mkdir()
+                checkpoint = directory / 'checkpoint.pth'
+                checkpoint.touch()
+                (directory / 'experiment.json').write_text(json.dumps({'variant': stored, 'temporal_weight': 0.05}))
+                (directory / 'checkpoint-regular.json').write_text(json.dumps({'mAP': 0.5, 'top_k': [0.6]}))
+                paths[name] = checkpoint
+            experiment.compare(paths, root / 'comparison.json')
+            self.assertIn('full_bbox_pose2', json.loads((root / 'comparison.json').read_text())['variants'])
+
+class MotionCacheIdentityTests(unittest.TestCase):
+    def test_pose_cache_uses_pose_checkpoint_without_unrelated_base_checkpoint(self):
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from cucps import experiment
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkpoint = root / 'pose.pt'
+            checkpoint.write_bytes(b'pose')
+            paths = {('motion', 'pose_checkpoint'): checkpoint,
+                     ('motion', 'repo'): root, ('motion', 'weights'): root / 'weights',
+                     ('prw', 'root'): root}
+            cfg = {'motion': {'name': 'test', 'size': [32, 32], 'person_crop': {},
+                              'heatmap_radius_cells': 1, 'pose': {'model': 'test-pose'}}}
+            dataset = SimpleNamespace(record=[], get_data_info=lambda: ([],))
+            metadata = experiment._cache_metadata(cfg, paths, dataset, 'full_bbox_pose2')
+            self.assertEqual(metadata['motion_checkpoint'], str(checkpoint))
+            self.assertEqual(metadata['model_variant'], 'full_bbox_pose2')
+
+class SemanticPriorIntegrationTests(unittest.TestCase):
+    def test_semantic_prior_supplies_pose_and_scene_features(self):
+        from unittest.mock import patch
+        from cucps import experiment
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ('c1s1_000001.jpg', 'c1s1_000002.jpg'):
+                Image.new('RGB', (32, 32)).save(root / name)
+            records = [{'im_name': name, 'boxes': np.array([[1, 2, 20, 29]]), 'cnt': [index + 1]}
+                       for index, name in enumerate(('c1s1_000001.jpg', 'c1s1_000002.jpg'))]
+            dataset = SimpleNamespace(record=records, data_path=str(root), get_data_info=lambda: ([0, 1],))
+            cfg = {'motion': {'size': [32, 32], 'batch_size': 1, 'heatmap_radius_cells': 1,
+                              'person_crop': {'size': [16, 16], 'scale': 1.0},
+                              'semantic': {'model': 'x', 'revision': 'y', 'device': 'cpu'}}}
+            paths = {('temporal_prior', 'cache'): root / 'prior.npz'}
+            seen = []
+            def model(image, bbox, crop, pose, semantic):
+                seen.append((tuple(pose.shape), tuple(semantic.shape)))
+                return torch.ones((len(image), 1, 2, 2))
+            with patch.object(experiment, '_cache_metadata', return_value={'version': 1}), \
+                 patch.object(experiment, '_motion_model', return_value=model), \
+                 patch.object(experiment, '_make_pose_estimator', return_value=object()), \
+                 patch.object(experiment, '_predict_relative_poses', return_value=np.zeros((1, 17, 3), dtype=np.float32)), \
+                 patch.object(experiment, 'SegFormerPredictor', return_value=lambda image: np.ones((150, 2, 2), dtype=np.float32)):
+                rows = experiment.prepare_temporal_prior(cfg, dataset, torch.device('cpu'), paths, 'full_bbox_pose_seg')
+            self.assertEqual(seen, [((1, 17, 3), (1, 150, 2, 2))])
+            self.assertEqual(len(rows[0][1]), 1)
+
+class MotionSampleTests(unittest.TestCase):
+    def test_scene_only_variant_does_not_require_person_crop(self):
+        from cucps.experiment import _motion_sample
+        image = Image.new('RGB', (32, 24))
+        scene, box, crop, scale, offset = _motion_sample(image, [1, 2, 15, 20], (32, 32), None)
+        self.assertEqual(scene.shape, (3, 32, 32))
+        self.assertIsNone(crop)

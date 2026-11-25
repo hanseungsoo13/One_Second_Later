@@ -1,4 +1,9 @@
 """Extract CUCPS + motion scores, fit a scalar reranker, and evaluate it."""
+import sys
+from pathlib import Path
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / 'src'))
 import argparse,json,math,sys
 from functools import lru_cache
 from pathlib import Path
@@ -7,10 +12,10 @@ import torch,yaml
 from scipy.io import loadmat
 from PIL import Image
 from torchvision.ops import box_iou
-sys.path.insert(0,str(Path(__file__).resolve().parent/'src'))
+sys.path.insert(0,str(_ROOT/'src'))
 from osl.data import AnnotationDataset
 from osl.model import DinoBackbone,Model
-from osl.temporal_search import location_scores,search_metrics
+from integration.location import location_scores,search_metrics
 
 def ann_boxes(path):
  data=loadmat(path)
@@ -24,7 +29,7 @@ def ann_boxes(path):
  return np.asarray(out,dtype=np.float32).reshape(-1,4)
 
 def extract(cfg,part):
- from osl.cucps import CUCPS
+ from cucps.search import CUCPS
  c=cfg['cucps'];m=cfg['motion'];dev=torch.device(cfg['runtime']['device']);out=Path(cfg['output_root']);out.mkdir(parents=True,exist_ok=True);dest=out/f'{part}_candidates.jsonl'
  if dest.exists():raise FileExistsError(f'Refusing to overwrite {dest}; choose a new output_root')
  split='train' if part=='train' else 'val';data=AnnotationDataset(Path(cfg['pairs_root'])/part,['PRW-temporal'],split,m['size'],m['person_crop']);

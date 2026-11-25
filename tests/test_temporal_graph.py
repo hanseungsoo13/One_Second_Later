@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 from osl.cucps_temporal import build_temporal_graph, refine_temporal_positives
-from cucps_temporal_experiment import _attach_temporal_graph
+from cucps.experiment import _attach_temporal_graph
 
 
 class TemporalGraphTests(unittest.TestCase):

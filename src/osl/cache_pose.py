@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import yaml
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
 from osl.data import AnnotationDataset
 from osl.pose import pose_key, relative_pose
 

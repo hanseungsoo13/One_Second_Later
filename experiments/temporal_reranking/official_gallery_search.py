@@ -1,4 +1,9 @@
 """CUCPS PRW official full-gallery baseline and temporal reranking experiment."""
+import sys
+from pathlib import Path
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / 'src'))
 import argparse,json,pickle,sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,12 +12,12 @@ import torch,yaml
 from PIL import Image
 from scipy.io import loadmat
 
-HERE=Path(__file__).resolve().parent;sys.path.insert(0,str(HERE/'src'))
+HERE=_ROOT;sys.path.insert(0,str(HERE/'src'))
 from osl.data import AnnotationDataset
 from osl.model import DinoBackbone,Model
-from osl.cucps import CUCPS
-from osl.temporal_search import location_scores
-from osl.official_gallery import next_frame_map,prepare_gallery,evaluate_queries,fixed_fusion_weight
+from cucps.search import CUCPS
+from integration.location import location_scores
+from cucps.gallery import next_frame_map,prepare_gallery,evaluate_queries,fixed_fusion_weight
 
 class Records:
  def __init__(self,records,data_path):self.record=records;self.data_path=str(data_path)

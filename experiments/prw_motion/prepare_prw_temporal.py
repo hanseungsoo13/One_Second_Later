@@ -1,4 +1,9 @@
 """Create PRW temporal query pairs with train/validation/test isolation."""
+import sys
+from pathlib import Path
+_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / 'src'))
 import argparse, json, re
 from pathlib import Path
 from collections import defaultdict,Counter

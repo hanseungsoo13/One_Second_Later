@@ -1,0 +1,14 @@
+# Optional motion analysis; prepare PRW pairs and edit the referenced CUCPS configuration.
+experiment_config: configs/cucps/prw_pose2.yaml
+pairs_root: outputs/example/prw_pairs/test
+sequence: PRW-temporal
+output: outputs/example/analysis/prw_motion.json
+models:
+- full_bbox_pose2
+gap_upper_bounds:
+- 25
+- 50
+- 100
+- 375
+batch_size: 4
+device: cuda

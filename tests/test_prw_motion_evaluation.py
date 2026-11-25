@@ -1,6 +1,6 @@
 import unittest
 
-from evaluate_prw_motion import gap_group, summarize
+from experiments.prw_motion.evaluate_prw_motion import gap_group, summarize
 
 
 class PRWMotionEvaluationTests(unittest.TestCase):
@@ -25,3 +25,11 @@ class PRWMotionEvaluationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class ModelNameTests(unittest.TestCase):
+    def test_accepts_new_names_and_rejects_duplicate_aliases(self):
+        from experiments.prw_motion.evaluate_prw_motion import resolve_evaluation_models
+        models = resolve_evaluation_models(['full_bbox_c', 'full_bbox_pose_seg'])
+        self.assertEqual([model.name for model in models.values()], ['full_bbox_c', 'full_bbox_pose_seg'])
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            resolve_evaluation_models(['e2c', 'full_bbox_c'])

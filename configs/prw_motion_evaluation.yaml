@@ -2,7 +2,7 @@ experiment_config: configs/cucps_temporal_prw_pose_p2.yaml
 pairs_root: ../PRW_temporal_search/pairs/test
 sequence: PRW-temporal
 output: ../PRW_evaluation/motion_test_metrics.json
-models: [e2c, pose_p2]
+models: [full_bbox_c, full_bbox_pose2]
 gap_upper_bounds: [25, 50, 100, 375]
 batch_size: 4
 device: cuda

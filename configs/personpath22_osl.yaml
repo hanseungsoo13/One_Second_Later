@@ -74,7 +74,7 @@ data:
   - 384
   - 640
 model:
-  variant: e2c_p2
+  variant: full_bbox_pose2
   person_crop:
     size:
     - 224

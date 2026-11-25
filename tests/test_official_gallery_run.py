@@ -2,7 +2,7 @@ import sys,tempfile,unittest
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-import official_gallery_search as app
+from experiments.temporal_reranking import official_gallery_search as app
 
 class OfficialRunTests(unittest.TestCase):
  def test_fresh_run_extracts_then_compares(self):

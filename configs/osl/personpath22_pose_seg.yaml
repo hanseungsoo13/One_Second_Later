@@ -1,0 +1,42 @@
+# Example using one sequence; set paths and select all desired sequences.
+data:
+  root: /path/to/personpath22_processed
+  train: &id001
+  - uid_vid_00001
+  val: *id001
+  size:
+  - 384
+  - 640
+model:
+  variant: full_bbox_pose_seg
+  person_crop:
+    size:
+    - 224
+    - 224
+    scale: 2.0
+  pose:
+    cache:
+      train: outputs/example/pose/train.sqlite
+      val: outputs/example/pose/val.sqlite
+    device: cpu
+  repo: external/dinov3
+  weights: /path/to/dinov3_weights.pth
+  name: dinov3_vitb16
+  semantic:
+    model: nvidia/segformer-b2-finetuned-ade-512-512
+    revision: de01bae28967510f9ddd496c60a969357195400c
+    cache: outputs/example/semantic/ade20k.sqlite
+    device: cuda
+training:
+  seed: 42
+  batch_size: 4
+  workers: 4
+  epochs: 50
+  early_stopping_patience: 8
+  lr: 0.0001
+  weight_decay: 0.01
+  warmup_epochs: 3
+  sigma: 2.5
+  output: outputs/example/osl_semantic
+wandb:
+  enabled: false

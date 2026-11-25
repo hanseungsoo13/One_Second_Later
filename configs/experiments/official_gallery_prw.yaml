@@ -1,0 +1,28 @@
+# Optional analysis, not the main CUCPS evaluation. Set all paths before running.
+prw_root: /path/to/PRW-v16.04.20
+output_root: outputs/example/analysis/official_gallery_prw
+cucps:
+  repo: external/CUCPS_official
+  args: /path/to/cucps/args.json
+  checkpoint: /path/to/cucps/checkpoint.pth
+  detection_threshold: 0.9
+  remove_unlabel: true
+  ignore_cam_id: true
+motion:
+  repo: external/dinov3
+  weights: /path/to/dinov3_weights.pth
+  name: dinov3_vitb16
+  checkpoint: /path/to/full_bbox_c/best.pt
+  size:
+  - 384
+  - 640
+  person_crop:
+    size:
+    - 224
+    - 224
+    scale: 2.0
+  heatmap_radius_cells: 1
+runtime:
+  device: cuda
+fusion:
+  weight: 0.05

@@ -4,34 +4,52 @@ from torch import nn
 import torch.nn.functional as F
 
 class DinoBackbone(nn.Module):
+
     def __init__(self, repo, weights, name='dinov3_vitb16'):
-        super().__init__(); self.net=torch.hub.load(repo,name,source='local',weights=weights); self.net.requires_grad_(False); self.net.eval(); self.channels=self.net.embed_dim
+        super().__init__()
+        self.net = torch.hub.load(repo, name, source='local', weights=weights)
+        self.net.requires_grad_(False)
+        self.net.eval()
+        self.channels = self.net.embed_dim
+
     def train(self, mode=True):
-        super().train(mode); self.net.eval(); return self
-    def forward(self,x):
-        with torch.no_grad(): f=self.net.forward_features(x)['x_norm_patchtokens']
-        h,w=x.shape[-2]//16,x.shape[-1]//16
-        return f.transpose(1,2).reshape(x.shape[0],self.channels,h,w)
+        super().train(mode)
+        self.net.eval()
+        return self
 
-def spatial_prompt(box,h,w,image_size,clip=5.,sigma=1.5):
-    ih,iw=image_size; device=box.device
-    y=(torch.arange(h,device=device)+.5)*ih/h; x=(torch.arange(w,device=device)+.5)*iw/w
-    yy,xx=torch.meshgrid(y,x,indexing='ij'); xx=xx[None]; yy=yy[None]
-    x1,y1,x2,y2=[v[:,None,None] for v in box.unbind(1)]
-    fx=(x1+x2)/2; fy=y2; bh=(y2-y1).clamp_min(1)
-    mask=((xx>=x1)&(xx<=x2)&(yy>=y1)&(yy<=y2)).float()
-    gaussian=torch.exp(-.5*(((xx-fx)/(iw/w*sigma))**2+((yy-fy)/(ih/h*sigma))**2))
-    return torch.stack((mask,gaussian,((xx-fx)/bh).clamp(-clip,clip).expand(-1,h,w),((yy-fy)/bh).clamp(-clip,clip).expand(-1,h,w)),1)
+    def forward(self, x):
+        with torch.no_grad():
+            f = self.net.forward_features(x)['x_norm_patchtokens']
+        h, w = (x.shape[-2] // 16, x.shape[-1] // 16)
+        return f.transpose(1, 2).reshape(x.shape[0], self.channels, h, w)
 
-def position(h,w,c,device):
-    assert c%4==0
-    freq=torch.exp(torch.arange(c//4,device=device)*(-math.log(10000)/(c//4)))
-    y,x=torch.meshgrid(torch.arange(h,device=device),torch.arange(w,device=device),indexing='ij')
-    a=x.flatten()[:,None]*freq; b=y.flatten()[:,None]*freq
-    return torch.cat([a.sin(),a.cos(),b.sin(),b.cos()],1)[None]
+def spatial_prompt(box, h, w, image_size, clip=5.0, sigma=1.5):
+    ih, iw = image_size
+    device = box.device
+    y = (torch.arange(h, device=device) + 0.5) * ih / h
+    x = (torch.arange(w, device=device) + 0.5) * iw / w
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    xx = xx[None]
+    yy = yy[None]
+    x1, y1, x2, y2 = [v[:, None, None] for v in box.unbind(1)]
+    fx = (x1 + x2) / 2
+    fy = y2
+    bh = (y2 - y1).clamp_min(1)
+    mask = ((xx >= x1) & (xx <= x2) & (yy >= y1) & (yy <= y2)).float()
+    gaussian = torch.exp(-0.5 * (((xx - fx) / (iw / w * sigma)) ** 2 + ((yy - fy) / (ih / h * sigma)) ** 2))
+    return torch.stack((mask, gaussian, ((xx - fx) / bh).clamp(-clip, clip).expand(-1, h, w), ((yy - fy) / bh).clamp(-clip, clip).expand(-1, h, w)), 1)
+
+def position(h, w, c, device):
+    assert c % 4 == 0
+    freq = torch.exp(torch.arange(c // 4, device=device) * (-math.log(10000) / (c // 4)))
+    y, x = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
+    a = x.flatten()[:, None] * freq
+    b = y.flatten()[:, None] * freq
+    return torch.cat([a.sin(), a.cos(), b.sin(), b.cos()], 1)[None]
 
 class PoseEncoder(nn.Module):
     """Encode 17 bounding-box-relative (x, y, confidence) keypoints."""
+
     def __init__(self, dim=256):
         super().__init__()
         self.net = nn.Sequential(nn.Linear(51, dim), nn.GELU(), nn.Linear(dim, dim))
@@ -42,58 +60,71 @@ class PoseEncoder(nn.Module):
         return self.net(keypoints.flatten(1))
 
 class Model(nn.Module):
-    def __init__(self,backbone,transformer=True,dim=256,person_branch=False,crop_size=None,pose_fusion=None,semantic_channels=None):
-        super().__init__(); self.backbone=backbone
-        if person_branch and not transformer: raise ValueError("Person branch requires the transformer")
-        if pose_fusion not in (None, 'p1', 'p2'): raise ValueError('Invalid pose fusion')
-        if pose_fusion and not person_branch: raise ValueError('Pose requires the person branch')
+
+    def __init__(self, backbone, transformer=True, dim=256, person_branch=False, crop_size=None, pose_fusion=None, semantic_channels=None):
+        super().__init__()
+        self.backbone = backbone
+        if person_branch and (not transformer):
+            raise ValueError('Person branch requires the transformer')
+        if pose_fusion not in (None, 'p1', 'p2'):
+            raise ValueError('Invalid pose fusion')
+        if pose_fusion and (not person_branch):
+            raise ValueError('Pose requires the person branch')
         self.pose_fusion = pose_fusion
         self.pose_encoder = PoseEncoder(dim) if pose_fusion else None
         self.pose_projection = nn.Linear(dim, dim) if pose_fusion == 'p2' else None
         self.pose_gate = nn.Linear(2 * dim, dim) if pose_fusion == 'p2' else None
         self.semantic_projection = nn.Conv2d(semantic_channels, 64, 1) if semantic_channels else None
-        self.person_projection=nn.Linear(backbone.channels,dim) if person_branch else None
-        self.projection=nn.Sequential(nn.Conv2d(backbone.channels+4+(64 if semantic_channels else 0),dim,1),nn.GroupNorm(32,dim),nn.GELU())
-        self.transformer=nn.TransformerEncoder(nn.TransformerEncoderLayer(dim,8,1024,.1,batch_first=True,norm_first=True),2,enable_nested_tensor=False) if transformer else None
-        self.decoder=nn.Sequential(nn.Conv2d(dim,128,3,padding=1),nn.GroupNorm(32,128),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(128,64,3,padding=1),nn.GELU(),nn.Upsample(scale_factor=2,mode='bilinear',align_corners=False),nn.Conv2d(64,32,3,padding=1),nn.GELU(),nn.Conv2d(32,1,1))
-    def forward(self,image,bbox,person_crop=None,pose=None,semantic=None):
-        f=self.backbone(image); b,c,h,w=f.shape
+        self.person_projection = nn.Linear(backbone.channels, dim) if person_branch else None
+        self.projection = nn.Sequential(nn.Conv2d(backbone.channels + 4 + (64 if semantic_channels else 0), dim, 1), nn.GroupNorm(32, dim), nn.GELU())
+        self.transformer = nn.TransformerEncoder(nn.TransformerEncoderLayer(dim, 8, 1024, 0.1, batch_first=True, norm_first=True), 2, enable_nested_tensor=False) if transformer else None
+        self.decoder = nn.Sequential(nn.Conv2d(dim, 128, 3, padding=1), nn.GroupNorm(32, 128), nn.GELU(), nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(128, 64, 3, padding=1), nn.GELU(), nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), nn.Conv2d(64, 32, 3, padding=1), nn.GELU(), nn.Conv2d(32, 1, 1))
+
+    def forward(self, image, bbox, person_crop=None, pose=None, semantic=None):
+        f = self.backbone(image)
+        b, c, h, w = f.shape
         parts = [f]
         if self.semantic_projection is not None:
-            if semantic is None: raise ValueError('semantic is required for the semantic branch')
-            if semantic.ndim != 4 or semantic.shape[0] != b or semantic.shape[1] != self.semantic_projection.in_channels or semantic.shape[-2:] != (h,w):
+            if semantic is None:
+                raise ValueError('semantic is required for the semantic branch')
+            if semantic.ndim != 4 or semantic.shape[0] != b or semantic.shape[1] != self.semantic_projection.in_channels or (semantic.shape[-2:] != (h, w)):
                 raise ValueError('semantic probabilities must match the scene grid')
             parts.append(self.semantic_projection(semantic))
-        parts.append(spatial_prompt(bbox,h,w,image.shape[-2:]))
-        f=self.projection(torch.cat(parts,1))
+        parts.append(spatial_prompt(bbox, h, w, image.shape[-2:]))
+        f = self.projection(torch.cat(parts, 1))
         if self.transformer is not None:
-            pos=position(h,w,f.shape[1],f.device)
-            tokens=f.flatten(2).transpose(1,2)+pos
+            pos = position(h, w, f.shape[1], f.device)
+            tokens = f.flatten(2).transpose(1, 2) + pos
             if self.person_projection is not None:
-                if person_crop is None: raise ValueError('person_crop is required for the person branch')
-                person=self.person_projection(self.backbone(person_crop).mean(dim=(2,3)))
+                if person_crop is None:
+                    raise ValueError('person_crop is required for the person branch')
+                person = self.person_projection(self.backbone(person_crop).mean(dim=(2, 3)))
                 if self.pose_encoder is not None:
-                    if pose is None: raise ValueError('pose is required for the pose branch')
+                    if pose is None:
+                        raise ValueError('pose is required for the pose branch')
                     pose_token = self.pose_encoder(pose)
                     if self.pose_fusion == 'p2':
                         gate = torch.sigmoid(self.pose_gate(torch.cat((person, pose_token), dim=1)))
                         person = person + gate * self.pose_projection(pose_token)
-                ih,iw=image.shape[-2:]
-                px=(((bbox[:,0]+bbox[:,2])/2)*w/iw).long().clamp(0,w-1)
-                py=(bbox[:,3]*h/ih).long().clamp(0,h-1)
-                person=person+pos[0,py*w+px]
-                tokens=torch.cat((person[:,None,:],tokens),dim=1)
+                ih, iw = image.shape[-2:]
+                px = ((bbox[:, 0] + bbox[:, 2]) / 2 * w / iw).long().clamp(0, w - 1)
+                py = (bbox[:, 3] * h / ih).long().clamp(0, h - 1)
+                person = person + pos[0, py * w + px]
+                tokens = torch.cat((person[:, None, :], tokens), dim=1)
                 if self.pose_fusion == 'p1':
-                    tokens=torch.cat(((pose_token+pos[0,py*w+px])[:,None,:],tokens),dim=1)
-            tokens=self.transformer(tokens)
-            if self.person_projection is not None: tokens=tokens[:,2 if self.pose_fusion == 'p1' else 1:]
-            f=tokens.transpose(1,2).reshape(b,-1,h,w)
+                    tokens = torch.cat(((pose_token + pos[0, py * w + px])[:, None, :], tokens), dim=1)
+            tokens = self.transformer(tokens)
+            if self.person_projection is not None:
+                tokens = tokens[:, 2 if self.pose_fusion == 'p1' else 1:]
+            f = tokens.transpose(1, 2).reshape(b, -1, h, w)
         return self.decoder(f)
 
-def heatmap_loss(logits,target,image_size,sigma):
-    b,_,h,w=logits.shape; ih,iw=image_size
-    x=(torch.arange(w,device=logits.device)+.5)*iw/w; y=(torch.arange(h,device=logits.device)+.5)*ih/h
-    yy,xx=torch.meshgrid(y,x,indexing='ij')
-    q=torch.exp(-.5*(((xx-target[:,0,None,None])/(iw/w*sigma))**2+((yy-target[:,1,None,None])/(ih/h*sigma))**2))
-    q=q/q.sum((1,2),keepdim=True).clamp_min(1e-12)
-    return -(q.flatten(1)*F.log_softmax(logits.float().flatten(1),dim=1)).sum(1).mean()
+def heatmap_loss(logits, target, image_size, sigma):
+    b, _, h, w = logits.shape
+    ih, iw = image_size
+    x = (torch.arange(w, device=logits.device) + 0.5) * iw / w
+    y = (torch.arange(h, device=logits.device) + 0.5) * ih / h
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    q = torch.exp(-0.5 * (((xx - target[:, 0, None, None]) / (iw / w * sigma)) ** 2 + ((yy - target[:, 1, None, None]) / (ih / h * sigma)) ** 2))
+    q = q / q.sum((1, 2), keepdim=True).clamp_min(1e-12)
+    return -(q.flatten(1) * F.log_softmax(logits.float().flatten(1), dim=1)).sum(1).mean()
