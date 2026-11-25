@@ -1,0 +1,24 @@
+prw_root: /root/dataset/PersonSearch/PRW-v16.04.20
+output_root: ../PRW_official_gallery/results_20261123_01
+cucps:
+  repo: external/CUCPS_official
+  args: external/weights/cucps_prw/args.json
+  checkpoint: external/weights/cucps_prw/checkpoint_epoch18.pth
+  detection_threshold: 0.9
+  remove_unlabel: true
+  ignore_cam_id: true
+motion:
+  repo: external/dinov3
+  weights: /root/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  name: dinov3_vitb16
+  checkpoint: outputs/personpath22-ground-view-e2c-20261119-01/best.pt
+  size: [384, 640]
+  person_crop:
+    size: [224, 224]
+    scale: 2.0
+  heatmap_radius_cells: 1
+runtime:
+  device: cuda
+fusion:
+  # Illustrative fixed value; not learned or tuned using PRW temporal labels.
+  weight: 0.05
