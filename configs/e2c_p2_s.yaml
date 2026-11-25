@@ -1,0 +1,40 @@
+data:
+  root: ../MOT17_prediction
+  train: [MOT17-02-FRCNN, MOT17-04-FRCNN, MOT17-09-FRCNN]
+  val: [MOT17-02-FRCNN, MOT17-04-FRCNN, MOT17-09-FRCNN]
+  size: [384, 640]
+model:
+  variant: e2c_p2_s
+  person_crop:
+    size: [224, 224]
+    scale: 2.0
+  pose:
+    cache:
+      train: ../One_Second_Later/outputs/pose-cache/train.sqlite
+      val: ../One_Second_Later/outputs/pose-cache/val.sqlite
+    device: cpu
+  semantic:
+    model: nvidia/segformer-b2-finetuned-ade-512-512
+    revision: de01bae28967510f9ddd496c60a969357195400c
+    cache: outputs/semantic-cache/ade20k.sqlite
+    device: cuda
+  repo: ../One_Second_Later/external/dinov3
+  weights: /root/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  name: dinov3_vitb16
+training:
+  seed: 42
+  batch_size: 4
+  workers: 4
+  epochs: 50
+  early_stopping_patience: 8
+  lr: 0.0001
+  weight_decay: 0.01
+  warmup_epochs: 3
+  sigma: 2.5
+  output: outputs/annotations-e2c-p2-s
+wandb:
+  enabled: true
+  python_deps: ../One_Second_Later/external/python-deps
+  mode: offline
+  entity: hanseungsoo-unist
+  project: One_Second_Later

@@ -271,3 +271,44 @@ The comparison reports mAP and Rank-1 changes in percentage points. Do not
 compare this result to the earlier post-search reranking experiment as though
 the clustering stage were unchanged: this experiment trains CUCPS with the
 temporal prior inside HNM.
+
+## E2-C + P2 + semantic segmentation
+
+`configs/e2c_p2_s.yaml` combines the existing P2 gated pose/appearance token
+with semantic scene features. A frozen SegFormer-B2 pretrained on ADE20K
+predicts 150 class probabilities per scene grid location. A trainable 1×1
+convolution maps these to 64 channels, which are concatenated with frozen
+DINOv3 scene features and the existing bounding-box maps before the scene
+projection. The transformer and heatmap decoder are unchanged; there is no
+semantic hard mask. SegFormer runs offline only, and the two P2 branches still
+share the frozen DINOv3 backbone.
+
+The cache stores one float16 150×24×40 probability map per unique image in a
+SQLite file (about 281 KiB per image before SQLite overhead). It uses the
+same RGB letterboxing as the scene input *before* SegFormer preprocessing,
+then resizes its logits to the scene grid and applies softmax. Image size,
+scene size, grid size, model identifier, and model revision are checked;
+incomplete caches and configuration mismatches fail before training. The
+fixed revision is `de01bae28967510f9ddd496c60a969357195400c`. No spatial
+augmentation is currently applied; any future spatial transform must be
+applied consistently to scene, boxes, targets, pose, and semantic maps.
+
+In this worktree, the example YAML reuses DINOv3, the Pose caches, and W&B
+packages from the adjacent `One_Second_Later` checkout. Adjust these paths if
+that checkout is elsewhere. Install SegFormer dependencies in this worktree's
+ignored `external` folder, then generate both splits into the shared cache:
+
+```bash
+PY=/root/workplace/miniconda3/envs/flypose/bin/python
+$PY -m pip install --target external/segmentation-deps 'transformers==4.48.3'
+PYTHONPATH=external/segmentation-deps $PY cache_semantic.py --config configs/e2c_p2_s.yaml --split train
+PYTHONPATH=external/segmentation-deps $PY cache_semantic.py --config configs/e2c_p2_s.yaml --split val
+$PY run.py train --config configs/e2c_p2_s.yaml
+$PY run.py eval --config configs/e2c_p2_s.yaml --checkpoint outputs/annotations-e2c-p2-s/best.pt
+```
+
+The first cache command downloads the specified official checkpoint. Set the
+cache generation device and all experiment settings in the YAML. Cache creation
+is resumable and skips already stored images. Choose a unique training output
+path for every run. Full P2+S training, Pose shuffling, and unseen-scene
+comparison must be run separately before drawing performance conclusions.
