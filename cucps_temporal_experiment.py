@@ -49,6 +49,7 @@ class ModernMemoryLayer(torch.autograd.Function):
 
 from osl.cucps_temporal import add_temporal_prior, next_frame_indices
 from osl.model import DinoBackbone, Model
+from osl.pose import relative_pose
 from osl.temporal_search import location_scores
 
 
@@ -58,14 +59,50 @@ def _paths(cfg):
     for group, keys in {
         'cucps': ('repo',),
         'prw': ('root',),
-        'motion': ('repo', 'weights', 'checkpoint'),
+        'motion': ('repo', 'weights', 'checkpoint', 'pose_checkpoint'),
         'temporal_prior': ('cache',),
         'training': ('output_root',),
     }.items():
         for key in keys:
+            if key not in cfg[group]:
+                continue
             path = Path(cfg[group][key]).expanduser()
             resolved[(group, key)] = (path if path.is_absolute() else base / path).resolve()
     return resolved
+
+
+def _load_prw_probes_utf8(dataset):
+    """Read the official CRLF probe list as decoded text on Python 3."""
+    query_info = Path(dataset.root) / 'query_info.txt'
+    with query_info.open('r', encoding='utf-8', newline='') as handle:
+        lines = handle.readlines()
+
+    probes = []
+    for line in lines:
+        fields = line.split()
+        pid = int(fields[0])
+        x, y, width, height = map(float, fields[1:5])
+        roi = np.array([x, y, x + width, y + height], dtype=np.int32)
+        roi = np.clip(roi, 0, None)
+        image_name = fields[5].strip() + '.jpg'
+        probes.append({
+            'im_name': image_name,
+            'boxes': roi[np.newaxis, :],
+            'gt_pids': np.array([pid]),
+            'flipped': False,
+            'cam_id': dataset._get_cam_id(image_name),
+        })
+    return probes
+
+
+def _install_numpy_detection_compatibility(evaluator_module):
+    legacy_metric = evaluator_module.detection_performance_calc
+
+    def detection_performance_calc(dataset, gallery_det, *args, **kwargs):
+        detections = [det.tolist() if isinstance(det, np.ndarray) else det for det in gallery_det]
+        return legacy_metric(dataset, detections, *args, **kwargs)
+
+    evaluator_module.detection_performance_calc = detection_performance_calc
 
 
 def _load_cucps(cfg):
@@ -78,6 +115,7 @@ def _load_cucps(cfg):
 
     import lib.datasets as datasets
     from lib.datasets import PRW
+    PRW.load_probes = _load_prw_probes_utf8
     import lib.datasets.prw as prw_module
     from lib.utils.transforms import get_transform
     prw_module.xrange = range
@@ -142,20 +180,56 @@ def _motion_sample(image, box, output_size, person_crop_cfg):
     return pixels.transpose(2, 0, 1), transformed_box, crop_pixels.transpose(2, 0, 1), (resized_w / width, resized_h / height), (pad_x, pad_y)
 
 
-def _motion_model(cfg, device, paths):
+def _motion_model(cfg, device, paths, variant='temporal'):
     motion_cfg = cfg['motion']
+    pose_fusion = {'pose_p1': 'p1', 'pose_p2': 'p2'}.get(variant)
     model = Model(
         DinoBackbone(str(paths[('motion', 'repo')]), str(paths[('motion', 'weights')]), motion_cfg['name']),
         transformer=True,
         person_branch=True,
+        pose_fusion=pose_fusion,
     ).to(device)
-    checkpoint = torch.load(paths[('motion', 'checkpoint')], map_location='cpu', weights_only=False)
+    checkpoint_key = 'pose_checkpoint' if pose_fusion else 'checkpoint'
+    checkpoint = torch.load(paths[('motion', checkpoint_key)], map_location='cpu', weights_only=False)
     model.load_state_dict(checkpoint['model'], strict=True)
     model.eval()
     return model
 
 
-def _cache_metadata(cfg, paths, dataset):
+def _make_pose_estimator(cfg, device):
+    pose_cfg = cfg['motion'].get('pose', {})
+    try:
+        from rtmlib import RTMPose
+    except ImportError as exc:
+        raise RuntimeError('P1/P2 experiments require rtmlib (RTMPose) in the active environment') from exc
+    model_url = pose_cfg.get(
+        'model',
+        'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/'
+        'rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip',
+    )
+    return RTMPose(model_url, model_input_size=tuple(pose_cfg.get('input_size', [192, 256])),
+                   backend=pose_cfg.get('backend', 'onnxruntime'),
+                   device=pose_cfg.get('device', str(device)))
+
+
+def _predict_relative_poses(estimator, image, boxes):
+    """Run frozen RTMPose on current-frame boxes and return bbox-relative [N,17,3]."""
+    boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+    if not len(boxes):
+        return np.empty((0, 17, 3), dtype=np.float32)
+    bgr = np.asarray(image.convert('RGB'))[:, :, ::-1].copy()
+    xyxy = np.column_stack((boxes[:, :2], boxes[:, 2:]))
+    points, scores = estimator(bgr, xyxy.tolist())
+    poses = []
+    for point, score, box in zip(points, scores, boxes):
+        x1, y1, x2, y2 = box
+        poses.append(relative_pose(point, score, [x1, y1, x2 - x1, y2 - y1]))
+    if len(poses) != len(boxes):
+        raise RuntimeError('RTMPose returned a different number of poses than input boxes')
+    return np.stack(poses)
+
+
+def _cache_metadata(cfg, paths, dataset, variant='temporal'):
     checkpoint = paths[('motion', 'checkpoint')]
     stat = checkpoint.stat()
     motion_cfg = cfg['motion']
@@ -163,7 +237,7 @@ def _cache_metadata(cfg, paths, dataset):
         f"{record['im_name']}|{np.asarray(record['boxes']).tolist()}|{record['cnt']}"
         for record in dataset.record
     )
-    return {
+    metadata = {
         'version': 1,
         'prw_root': str(paths[('prw', 'root')]),
         'train_record_count': len(dataset.get_data_info()[0]),
@@ -178,6 +252,17 @@ def _cache_metadata(cfg, paths, dataset):
         'person_crop': motion_cfg['person_crop'],
         'heatmap_radius_cells': motion_cfg['heatmap_radius_cells'],
     }
+    if variant.startswith('pose_'):
+        pose_checkpoint = paths[('motion', 'pose_checkpoint')]
+        pose_stat = pose_checkpoint.stat()
+        metadata.update({
+            'variant': variant,
+            'pose_checkpoint': str(pose_checkpoint),
+            'pose_checkpoint_size': pose_stat.st_size,
+            'pose_checkpoint_mtime_ns': pose_stat.st_mtime_ns,
+            'pose_model': motion_cfg.get('pose', {}).get('model'),
+        })
+    return metadata
 
 
 def _read_prior_cache(path, metadata):
@@ -194,10 +279,10 @@ def _read_prior_cache(path, metadata):
 
 
 @torch.no_grad()
-def prepare_temporal_prior(cfg, dataset, device, paths):
+def prepare_temporal_prior(cfg, dataset, device, paths, variant='temporal'):
     """Predict next-image positions from boxes only; identity annotations are never read."""
     cache_path = paths[('temporal_prior', 'cache')]
-    metadata = _cache_metadata(cfg, paths, dataset)
+    metadata = _cache_metadata(cfg, paths, dataset, variant)
     cached = _read_prior_cache(cache_path, metadata)
     if cached is not None:
         print(f'Using temporal-prior cache: {cache_path}', flush=True)
@@ -222,7 +307,8 @@ def prepare_temporal_prior(cfg, dataset, device, paths):
     cuda_rng = torch.cuda.get_rng_state_all() if device.type == 'cuda' else None
     python_rng = random.getstate()
     numpy_rng = np.random.get_state()
-    model = _motion_model(cfg, device, paths)
+    model = _motion_model(cfg, device, paths, variant)
+    pose_estimator = _make_pose_estimator(cfg, device) if variant.startswith('pose_') else None
     # Loading the fixed predictor must not change CUCPS's seeded initialization
     # or data-order RNG relative to the baseline run.
     torch.set_rng_state(cpu_rng)
@@ -260,6 +346,7 @@ def prepare_temporal_prior(cfg, dataset, device, paths):
             _motion_sample(source_image, box, output_size, motion_cfg['person_crop'])
             for box in source_boxes
         ]
+        poses = _predict_relative_poses(pose_estimator, source_image, source_boxes) if pose_estimator else None
         scale, offset = sample_data[0][3], sample_data[0][4]
         candidate_scores = [[] for _ in source_boxes]
         for start in range(0, len(source_boxes), chunk_size):
@@ -267,8 +354,9 @@ def prepare_temporal_prior(cfg, dataset, device, paths):
             images = torch.from_numpy(np.stack([sample[0] for sample in chunk])).to(device)
             boxes = torch.from_numpy(np.stack([sample[1] for sample in chunk])).to(device)
             crops = torch.from_numpy(np.stack([sample[2] for sample in chunk])).to(device)
+            pose_chunk = torch.from_numpy(poses[start:start + chunk_size]).to(device) if poses is not None else None
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
-                logits = model(images, boxes, crops)
+                logits = model(images, boxes, crops, pose_chunk)
             heatmaps = logits.float().flatten(1).softmax(1).reshape(logits.shape[0], *logits.shape[-2:]).cpu().numpy()
             for local_index, heatmap in enumerate(heatmaps):
                 candidate_scores[start + local_index] = location_scores(
@@ -314,9 +402,18 @@ def _resolve_device(value):
     return device
 
 
+def _exclusive_epoch_end(epochs, start_epoch=1):
+    """Official CUCPS trainer uses an exclusive upper bound in range()."""
+    epochs = int(epochs)
+    start_epoch = int(start_epoch)
+    if epochs <= 0 or start_epoch <= 0:
+        raise ValueError('epochs and start_epoch must be positive')
+    return start_epoch + epochs
+
+
 def train(cfg, variant):
-    if variant not in ('baseline', 'temporal'):
-        raise ValueError('variant must be baseline or temporal')
+    if variant not in ('baseline', 'temporal', 'pose_p1', 'pose_p2'):
+        raise ValueError('variant must be baseline, temporal, pose_p1, or pose_p2')
     datasets, get_model, paths = _load_cucps(cfg)
     from configs import args_faster_rcnn
     from lib.utils.misc import Nestedspace, get_lr_scheduler, get_optimizer
@@ -334,6 +431,7 @@ def train(cfg, variant):
         '--num_cq_size', str(training['num_cq_size']),
         '--lr_decay_step', str(training['lr_decay_step']),
         '--batch_size', str(training['batch_size']), '--nw', str(training['workers']),
+        '--epochs', str(_exclusive_epoch_end(training['epochs'])),
         '--path', str(run_dir), '--seed', str(training['seed']), '--device', cfg['runtime']['device'],
     ]
     args = args_faster_rcnn().parse_args(cli, namespace=Nestedspace())
@@ -357,8 +455,8 @@ def train(cfg, variant):
         - int(train_loader.dataset.record[source_index]['im_name'].rsplit('_', 1)[1][:-4])
         for source_index, next_index in frame_pairs.items()
     ]
-    if variant == 'temporal':
-        prior_rows = prepare_temporal_prior(cfg, train_loader.dataset, device, paths)
+    if variant != 'baseline':
+        prior_rows = prepare_temporal_prior(cfg, train_loader.dataset, device, paths, variant)
     else:
         prior_rows = None
 
@@ -380,9 +478,14 @@ def train(cfg, variant):
     args.export_to_json(str(run_dir / 'args.json'))
     metadata = {
         'variant': variant,
-        'temporal_weight': float(cfg['temporal_prior']['weight']) if variant == 'temporal' else 0.0,
-        'temporal_prior_cache': str(paths[('temporal_prior', 'cache')]) if variant == 'temporal' else None,
-        'motion_checkpoint': str(paths[('motion', 'checkpoint')]) if variant == 'temporal' else None,
+        'requested_epochs': int(training['epochs']),
+        'trainer_epoch_end_exclusive': int(args.train.epochs),
+        'temporal_weight': float(cfg['temporal_prior']['weight']) if variant != 'baseline' else 0.0,
+        'temporal_prior_cache': str(paths[('temporal_prior', 'cache')]) if variant != 'baseline' else None,
+        'motion_checkpoint': str(paths[('motion', 'checkpoint')]) if variant != 'baseline' else None,
+        'pose_checkpoint': str(paths[('motion', 'pose_checkpoint')]) if variant.startswith('pose_') else None,
+        'pose_model': cfg['motion'].get('pose', {}).get('model') if variant.startswith('pose_') else None,
+        'pose_annotations_used': False,
         'prw_identity_labels_used_for_training': False,
         'next_frame_pairs': len(frame_pairs),
         'frame_number_gap': {
@@ -401,6 +504,8 @@ def train(cfg, variant):
 def evaluate(cfg, checkpoint):
     _, get_model, _ = _load_cucps(cfg)
     from lib.utils.misc import Nestedspace
+    import lib.utils.evaluator as evaluator_module
+    _install_numpy_detection_compatibility(evaluator_module)
     from runs.test import main as official_test
 
     # Build the same test arguments used by CUCPS and let it read run args.json.
@@ -414,37 +519,42 @@ def evaluate(cfg, checkpoint):
     print(f'OFFICIAL_EVALUATION_COMPLETE metrics={sidecar}', flush=True)
 
 
-def compare(baseline_checkpoint, temporal_checkpoint, output):
-    paths = [Path(baseline_checkpoint), Path(temporal_checkpoint)]
-    if not all(path.is_file() for path in paths):
-        raise FileNotFoundError('Both checkpoint files must exist')
-    experiment_paths = [path.parent / 'experiment.json' for path in paths]
-    if not all(path.is_file() for path in experiment_paths):
-        raise FileNotFoundError(f'Run metadata is missing: {experiment_paths}')
-    experiments = [json.loads(path.read_text()) for path in experiment_paths]
-    if [item.get('variant') for item in experiments] != ['baseline', 'temporal']:
-        raise ValueError('Pass the baseline checkpoint first and temporal checkpoint second')
-    metrics_paths = [path.with_name(path.name.replace('.pth', '-regular.json')) for path in paths]
-    if not all(path.is_file() for path in metrics_paths):
-        missing = [str(path) for path in metrics_paths if not path.is_file()]
-        raise FileNotFoundError(f'Run official test for both checkpoints first: {missing}')
-    metrics = [json.loads(path.read_text()) for path in metrics_paths]
+def compare(checkpoints, output):
+    """Compare any trained variants against the required baseline."""
+    if 'baseline' not in checkpoints:
+        raise ValueError('A baseline checkpoint is required')
+    variants, metrics = {}, {}
+    for variant, checkpoint in checkpoints.items():
+        path = Path(checkpoint)
+        if not path.is_file():
+            raise FileNotFoundError(f'{variant} checkpoint does not exist: {path}')
+        experiment_path = path.parent / 'experiment.json'
+        metric_path = path.with_name(path.name.replace('.pth', '-regular.json'))
+        if not experiment_path.is_file() or not metric_path.is_file():
+            raise FileNotFoundError(f'Run official test for {variant} first: {metric_path}')
+        experiment = json.loads(experiment_path.read_text())
+        if experiment.get('variant') != variant:
+            raise ValueError(f'{path} is tagged {experiment.get("variant")}, expected {variant}')
+        variants[variant] = {
+            'checkpoint': str(path.resolve()),
+            'temporal_weight': experiment['temporal_weight'],
+            'metrics': json.loads(metric_path.read_text()),
+        }
+        metrics[variant] = variants[variant]['metrics']
+    base = metrics['baseline']
+    for variant, row in variants.items():
+        row['delta'] = {
+            'mAP_percentage_points': 100 * (row['metrics']['mAP'] - base['mAP']),
+            'rank1_percentage_points': 100 * (row['metrics']['top_k'][0] - base['top_k'][0]),
+        }
     report = {
         'protocol': 'Official CUCPS PRW regular full-gallery evaluation',
-        'baseline_checkpoint': str(paths[0].resolve()),
-        'temporal_checkpoint': str(paths[1].resolve()),
-        'temporal_weight': experiments[1]['temporal_weight'],
-        'baseline': metrics[0],
-        'temporal': metrics[1],
-        'delta': {
-            'mAP_percentage_points': 100 * (metrics[1]['mAP'] - metrics[0]['mAP']),
-            'rank1_percentage_points': 100 * (metrics[1]['top_k'][0] - metrics[0]['top_k'][0]),
-        },
+        'variants': variants,
     }
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps(report['delta'], indent=2), flush=True)
+    print(json.dumps({k: v['delta'] for k, v in variants.items()}, indent=2), flush=True)
     print(f'Saved comparison: {output}', flush=True)
 
 
@@ -455,16 +565,23 @@ def main():
         sub = subparsers.add_parser(action)
         sub.add_argument('--config', required=True)
         if action == 'train':
-            sub.add_argument('--variant', required=True, choices=('baseline', 'temporal'))
+            sub.add_argument('--variant', required=True, choices=('baseline', 'temporal', 'pose_p1', 'pose_p2'))
         else:
             sub.add_argument('--checkpoint', required=True)
     sub = subparsers.add_parser('compare')
     sub.add_argument('--baseline-checkpoint', required=True)
-    sub.add_argument('--temporal-checkpoint', required=True)
+    sub.add_argument('--temporal-checkpoint')
+    sub.add_argument('--pose-p1-checkpoint')
+    sub.add_argument('--pose-p2-checkpoint')
     sub.add_argument('--output', required=True)
     args = parser.parse_args()
     if args.action == 'compare':
-        compare(args.baseline_checkpoint, args.temporal_checkpoint, args.output)
+        checkpoints = {'baseline': args.baseline_checkpoint}
+        checkpoints.update({variant: path for variant, path in (
+            ('temporal', args.temporal_checkpoint), ('pose_p1', args.pose_p1_checkpoint),
+            ('pose_p2', args.pose_p2_checkpoint),
+        ) if path})
+        compare(checkpoints, args.output)
         return
     cfg_path = Path(args.config)
     cfg = yaml.safe_load(cfg_path.read_text())

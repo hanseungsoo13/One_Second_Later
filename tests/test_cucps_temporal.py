@@ -1,10 +1,18 @@
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from tempfile import TemporaryDirectory
 
+import numpy as np
 import torch
+from PIL import Image
 
 from osl.cucps_temporal import add_temporal_prior, next_frame_indices
 from cucps_temporal_experiment import (
     _attach_temporal_prior, _resolve_device, _install_memory_compatibility,
+    _load_prw_probes_utf8, _install_numpy_detection_compatibility,
+    _predict_relative_poses,
+    _exclusive_epoch_end,
 )
 
 
@@ -29,6 +37,38 @@ class ModernMemoryLayerTests(unittest.TestCase):
         self.assertTrue(torch.allclose(memory, expected_memory))
 
 
+class DetectionMetricCompatibilityTests(unittest.TestCase):
+    def test_converts_numpy_arrays_for_legacy_empty_list_check(self):
+        def legacy_metric(dataset, detections):
+            return [bool(detection != []) for detection in detections]
+
+        evaluator = SimpleNamespace(detection_performance_calc=legacy_metric)
+        _install_numpy_detection_compatibility(evaluator)
+        detections = [np.ones((2, 5)), np.empty((0, 5))]
+
+        self.assertEqual(evaluator.detection_performance_calc(None, detections), [True, False])
+
+
+class ProbeLoaderCompatibilityTests(unittest.TestCase):
+    def test_loads_official_crlf_probe_list_as_text(self):
+        class Dataset:
+            def __init__(self, root):
+                self.root = root
+
+            def _get_cam_id(self, im_name):
+                return int(im_name[1])
+
+        with TemporaryDirectory() as temp_dir:
+            Path(temp_dir, 'query_info.txt').write_bytes(
+                b'42 10 20 30 40 c1s3_016471\r\n'
+            )
+            probes = _load_prw_probes_utf8(Dataset(temp_dir))
+
+        self.assertEqual(probes[0]['im_name'], 'c1s3_016471.jpg')
+        self.assertEqual(probes[0]['boxes'].tolist(), [[10, 20, 40, 60]])
+        self.assertEqual(probes[0]['gt_pids'].tolist(), [42])
+
+
 class DeviceResolutionTests(unittest.TestCase):
     def test_unindexed_cuda_resolves_to_visible_device_zero(self):
         self.assertEqual(_resolve_device('cuda'), torch.device('cuda:0'))
@@ -36,6 +76,31 @@ class DeviceResolutionTests(unittest.TestCase):
     def test_explicit_device_index_is_preserved(self):
         self.assertEqual(_resolve_device('cuda:2'), torch.device('cuda:2'))
         self.assertEqual(_resolve_device('cpu'), torch.device('cpu'))
+
+    def test_requested_epoch_count_matches_exclusive_official_loop(self):
+        self.assertEqual(len(range(1, _exclusive_epoch_end(25, 1))), 25)
+        self.assertEqual(len(range(19, _exclusive_epoch_end(25, 19))), 25)
+
+
+class PosePriorInputTests(unittest.TestCase):
+    def test_pose_estimator_receives_bgr_and_returns_box_relative_keypoints(self):
+        class Estimator:
+            def __call__(self, image, boxes):
+                self.image = image
+                self.boxes = boxes
+                points = np.tile(np.array([[[20., 30.]]], dtype=np.float32), (1, 17, 1))
+                scores = np.ones((1, 17), dtype=np.float32)
+                return points, scores
+
+        estimator = Estimator()
+        image = Image.new('RGB', (50, 60), color=(10, 20, 30))
+        boxes = np.array([[10., 10., 30., 50.]], dtype=np.float32)
+        poses = _predict_relative_poses(estimator, image, boxes)
+
+        self.assertEqual(estimator.image[0, 0].tolist(), [30, 20, 10])
+        self.assertEqual(estimator.boxes, [[10.0, 10.0, 30.0, 50.0]])
+        self.assertEqual(poses.shape, (1, 17, 3))
+        self.assertTrue(np.allclose(poses[0, 0], [.5, .5, 1.]))
 
 
 class AddTemporalPriorTests(unittest.TestCase):
