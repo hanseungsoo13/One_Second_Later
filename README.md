@@ -1,309 +1,102 @@
 # One Second Later
 
-Single-image pedestrian future localization with a frozen DINOv3 encoder. E0 predicts the current foot point; E2-A uses spatial conditioning and a convolutional decoder; E2-B adds two self-attention layers. E2-C additionally encodes a 2× person/context crop from the original image with the same frozen DINOv3 backbone, pools its patch features, and appends a projected person token to the scene transformer. The token carries the foot-point positional encoding; the box spatial maps and decoder are unchanged. The crop is aspect-preserving letterboxed to 224×224 and can include black padding outside the image. Only the current image and bounding box are model inputs.
+PersonPath22에서 사람의 다음 위치를 히트맵으로 예측하는 **OSL(One Second Later)** 모델을 학습하고, 이 모델의 위치 점수를 PRW의 CUCPS pseudo-ID 학습에 사용하는 방법입니다. 아래 명령은 모두 `One_Second_Later` 디렉터리에서 실행합니다.
 
-## Data
+OSL은 현재 이미지, 사람 bbox, 사람 주변 crop과 RTMPose 관절을 입력받습니다. Pose 특징을 사람 외형 특징에 gated fusion으로 결합하고 다음 위치 히트맵을 출력합니다. PRW에서는 OSL을 고정한 채 CUCPS를 학습합니다. 기존 코드와 설정에서 OSL은 `e2c_p2`, `pose_p2`라는 내부 식별자를 사용합니다.
 
-The default configurations directly load the user's existing `../MOT17_prediction/MOT17-{02,04,09}-FRCNN/{train,val}.jsonl` files. All records are used: 52,015 training and 11,999 validation examples. The files use a chronological 80:20 split within each sequence; train and validation share scenes and can share people. Validation measures later frames in the same scenes, not generalization to unseen scenes. Adjacent examples overlap heavily. No extra FPS sampling, visibility threshold or intermediate-track filtering is applied. The loader does not regenerate pairs from MOT17 GT.
+## 0. 설치 및 데이터 준비
 
-The JSONL contains some future foot positions outside the source image (1,874 train and 418 validation records). These examples are kept. A finite image heatmap cannot represent an outside location, so the training target and NLL use the nearest point on the original image boundary. FDE uses the original, unclipped coordinate. Therefore NLL and the learning target for these examples measure the projected boundary location, while FDE measures the actual annotated location. Heatmap cell NLL uses floor after transforming to the heatmap grid. FDE and movement use original-image pixels and current bounding-box height.
+아래는 Linux와 NVIDIA GPU를 사용하는 예시입니다. Git, Conda, NVIDIA 드라이버와 충분한 저장 공간이 필요합니다. 코드는 Git으로 받지만 **데이터, 전처리 결과, 모델 가중치와 학습 결과는 별도**로 준비해야 합니다.
 
-The JSONL does not contain intermediate positions. Visualizations can show stationary cases and worst errors, but cannot infer straight or turning categories from these annotations alone. The old sequence-separated experiments in `outputs/e2a` and `outputs/e2b` used different samples and must not be compared as if they used these splits. New configurations write to `outputs/annotations-e2a` and `outputs/annotations-e2b`.
+### 프로젝트와 가상환경
 
-## Setup
+```bash
+git clone https://github.com/hanseungsoo13/One_Second_Later.git
+cd One_Second_Later
 
-The following uses the existing `flypose` environment, images at the absolute paths in the JSONL, and the DINOv3 ViT-B/16 checkpoint. Obtain the official implementation (excluded from this repository):
+conda create -n osl python=3.11 -y
+conda activate osl
+python -m pip install --upgrade pip
+python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r requirements.txt onnxruntime
+```
+
+PyTorch 설치 예시는 CUDA 12.4용입니다. 환경에 맞지 않으면 [PyTorch 공식 설치 안내](https://pytorch.org/get-started/previous-versions/)에서 맞는 torch/torchvision 조합을 선택하세요. 기존 실험 환경은 Python 3.11, torch 2.6.0+cu124, torchvision 0.21.0+cu124였습니다. 위 명령으로 만든 새 환경 전체를 이번에 검증한 것은 아닙니다.
+
+```bash
+python -c "import torch, torchvision, onnxruntime; print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available()); print('ONNX providers:', onnxruntime.get_available_providers())"
+```
+
+`CUDA: True`인지 확인하세요. `onnxruntime`은 CPU용이므로 pose 추정이 느릴 수 있습니다. GPU용 ONNX Runtime은 드라이버 및 CUDA 호환성을 확인해 [공식 안내](https://onnxruntime.ai/docs/install/)에 따라 별도로 설치하세요. `CUDA_VISIBLE_DEVICES=2`는 물리 GPU 2번을 선택하는 예시이므로 실제 사용 가능한 번호로 바꿉니다.
+
+### DINOv3와 CUCPS
 
 ```bash
 mkdir -p external
 git clone https://github.com/facebookresearch/dinov3.git external/dinov3
 git -C external/dinov3 checkout 6876159a11b4df116f30f667f8c9888617df0751
-/root/workplace/miniconda3/envs/flypose/bin/pip install --target external/python-deps wandb
+git clone https://github.com/VIP-Lab-UNIST/CUCPS_official.git external/CUCPS_official
+git -C external/CUCPS_official checkout d6f1cf2d727300f655bbb871e6c45f5eaf4e45fb
 ```
 
-Set annotation root, sequences, batch size, output directory and W&B mode in the YAML files. W&B defaults to offline mode; authenticate and set `wandb.mode: online` for online tracking, or sync the offline run later. Do not put credentials in configuration or Git.
+[DINOv3 공식 안내](https://github.com/facebookresearch/dinov3)에 따라 **ViT-B/16 LVD-1689M** 가중치 `dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth`를 받아 사용합니다. 가중치는 라이선스 동의와 접근 승인이 필요할 수 있습니다. 받은 경로를 PersonPath22 YAML의 `model.weights`와 PRW YAML의 `motion.weights`에 각각 지정하세요. 현재 YAML의 `/root/.cache/...`는 기존 서버의 경로입니다.
+
+OSL용 [RTMPose](https://github.com/Tau-J/rtmlib) 모델은 `cache_pose.py`가 처음 실행될 때 다운로드합니다. CUCPS 학습은 torchvision의 사전학습 ResNet-50 백본을 사용하므로 처음 실행할 때 해당 가중치 다운로드가 필요할 수 있습니다.
+
+### PersonPath22 다운로드와 전처리
+
+1. [PersonPath22 공식 저장소](https://github.com/amazon-science/tracking-dataset)의 다운로드 안내를 따라 영상과 annotation을 받습니다. 공식 다운로드 스크립트는 AWS CLI와 `ffmpeg`/`ffprobe`가 필요하며, 일부 외부 데이터는 별도 안내가 있습니다.
+2. 학습에는 원본 영상 자체가 아니라, ground-view 영상을 선택해 **같은 사람의 현재 프레임과 약 1초 후 프레임을 연결한 JSONL 및 추출 이미지**가 필요합니다. 기존 실험은 68개 영상을 수동 선택했고, 각 영상의 시간순 80:20 train/validation 분할을 사용했습니다.
+3. 현재 저장소에는 이 ground-view 영상 목록과 전처리 스크립트가 **포함돼 있지 않습니다**. 기존 작업 환경에서는 저장소 상위 폴더의 `PersonPath22_analysis/ground_view_candidates.csv`와 `PersonPath22_ground_view/build_dataset.py`를 사용했습니다. 새 환경에서는 이 두 파일을 별도로 확보하고 CSV의 영상·annotation 경로를 실제 다운로드 위치로 수정한 뒤 실행하거나, 아래 형식의 학습 데이터를 직접 준비해야 합니다. 원본 다운로드만으로는 다음 학습 명령을 실행할 수 없습니다.
+
+기존 전처리 자료가 있는 경우 상위 폴더에서 `python PersonPath22_ground_view/build_dataset.py`로 생성할 수 있습니다. 이 스크립트는 기존 생성 파일을 덮어쓰므로 별도 위치에서 실행하세요. 결과 구조는 다음과 같습니다.
+
+```text
+../PersonPath22_ground_view/
+  uid_vid_00001/
+    train.jsonl
+    val.jsonl
+    images/
+  uid_vid_00002/...
+```
+
+각 JSONL에는 `sequence`, `person_id`, `frame`, `image_path`, `image_size`, `bbox_xywh`, `target_bottom_center_xy` 등이 필요합니다. `image_path`는 실행 환경에서 읽을 수 있어야 합니다. 기존 데이터는 amodal bbox를 사용했고, 같은 사람의 약 1초 후 annotation이 있는 쌍을 선택했습니다. 자세한 필드 처리는 `src/osl/data.py`를 참고하세요.
+
+### PRW 다운로드와 체크포인트
+
+[PRW 공식 페이지](https://zheng-lab-anu.github.io/Project/project_prw.html)의 v2016.04.20 데이터셋을 내려받아 압축을 풉니다. `frames/`, `annotations/`, `frame_train.mat`, `frame_test.mat`, `query_info.txt`가 같은 PRW 루트 아래에 있어야 합니다. 이 경로를 PRW 학습 YAML의 `prw.root`에 지정하세요.
+
+PRW OSL 학습 설정은 OSL 체크포인트 외에도 `motion.checkpoint`의 **기존 E2-C 체크포인트 파일**을 캐시 메타데이터 확인에 요구합니다. 이 파일은 저장소에 포함되지 않으므로 기존 실행에서 생성한 파일을 확보하고 YAML에 경로를 지정해야 합니다. 현재 코드만으로는 새로 학습한 OSL만으로 PRW 단계를 시작할 수 없습니다.
+
+## 1. PersonPath22 OSL 위치 예측 학습
+
+`configs/personpath22_osl.yaml`은 PersonPath22 ground-view 68개 시퀀스와 독립된 pose 캐시 및 출력 경로를 사용합니다. 데이터 위치와 DINOv3 가중치 경로를 환경에 맞게 확인하세요. 새 실험마다 `training.output`을 바꾸세요.
+
+현재 환경에는 68개 시퀀스가 있습니다. 위 설정은 기존 시퀀스별 train/val 분할을 그대로 사용하므로 두 분할이 같은 장면을 공유합니다. Pose 캐시를 생성한 후 OSL을 학습합니다. `CUDA_VISIBLE_DEVICES`는 사용할 GPU 번호로 바꾸세요.
 
 ```bash
-PY=/root/workplace/miniconda3/envs/flypose/bin/python
-$PY -m unittest discover -s tests -v
-$PY run.py e0 --config configs/e2a.yaml
-$PY run.py overfit --config configs/e2a.yaml --steps 100
-$PY run.py overfit --config configs/e2b.yaml --steps 100
-$PY run.py train --config configs/e2a.yaml
-$PY run.py train --config configs/e2b.yaml
-$PY run.py overfit --config configs/e2c.yaml --steps 100
-$PY run.py train --config configs/e2c.yaml
-$PY run.py eval --config configs/e2b.yaml --checkpoint outputs/annotations-e2b/best.pt
-$PY run.py visualize --config configs/e2b.yaml --checkpoint outputs/annotations-e2b/best.pt
+python cache_pose.py --config configs/personpath22_osl.yaml --split train
+python cache_pose.py --config configs/personpath22_osl.yaml --split val
+CUDA_VISIBLE_DEVICES=2 python run.py train --config configs/personpath22_osl.yaml
 ```
 
-E2-C uses the same annotation split, loss, decoder and optimizer settings as E2-B; crop size, context scale and output path are configurable in `configs/e2c.yaml`. Compare their respective validation metrics only after the runs complete.
+캐시는 재실행 시 기존 레코드를 재사용합니다. 학습은 검증 FDE가 가장 낮은 모델을 `outputs/personpath22-osl/run-01/best.pt`에 저장합니다. 기존 출력 디렉터리에 학습 로그가 있으면 덮어쓰지 않으므로 설정에서 새 경로를 지정하세요.
 
-Select a GPU with `CUDA_VISIBLE_DEVICES`. Training saves the lowest validation argmax pixel FDE as `best.pt`, and reports per-sequence and overall metrics. Choose a new output path in YAML for each training run. Letterbox applies the same transformation to the image, box and target. Visualizations show the box (green), current foot (cyan), original GT foot (yellow), argmax (red), and heatmap (red overlay). Points outside the image may not be visible.
+## 2. PRW OSL 기반 CUCPS 학습
 
-## E2-C 2 FPS ablation
+`configs/cucps_temporal_prw_osl.yaml`은 위 학습의 `best.pt`를 `motion.pose_checkpoint`로 사용하며, 별도의 prior 캐시와 출력 경로를 지정합니다. 데이터·체크포인트 경로를 확인하세요. 다른 OSL 체크포인트를 사용할 때는 `motion.pose_checkpoint`와 `temporal_prior.cache`를 함께 변경하세요.
 
-`configs/e2c_2fps.yaml` selects training start frames approximately 2 FPS from the same JSONL records, using FPS inferred from the annotated frame gap and time delta. All people at a selected frame are kept. Validation still uses all 11,999 original validation records; no annotation files are changed. All model and optimization settings are identical to `e2c.yaml`, except the separate output directory and training sample rate. Since epochs contain fewer training examples, 50 epochs also means fewer optimizer updates; comparisons must account for this difference.
+이 설정의 `motion.checkpoint`도 캐시 메타데이터 생성에 사용되므로 기존 E2-C 체크포인트가 해당 경로에 있어야 합니다. 경로가 다르면 YAML에서 수정하세요. OSL 가중치는 `motion.pose_checkpoint`에서 불러옵니다.
 
 ```bash
-$PY run.py train --config configs/e2c_2fps.yaml
+CUDA_VISIBLE_DEVICES=2 python cucps_temporal_experiment.py train \
+  --config configs/cucps_temporal_prw_osl.yaml --variant pose_p2
 ```
 
-## E2-C with pose
+설정상 CUCPS를 25에폭 학습하며, timestamp가 붙은 실행 디렉터리에 체크포인트가 저장됩니다. 시작 시 PRW 학습 이미지의 bbox로 OSL 히트맵을 만들고 다음에 존재하는 같은 카메라·장면 이미지의 후보 bbox마다 위치 점수를 캐시합니다. 이 점수는 CUCPS 학습 중 HNM/HPM의 pseudo-ID 후보 선택에 사용됩니다. PRW의 사람 ID 정답으로 OSL을 학습하거나 위치 점수를 맞추지 않습니다. PRW 이미지의 프레임 번호 간격은 일정하지 않습니다.
 
-`configs/e2c_p1.yaml` and `configs/e2c_p2.yaml` share the same frozen
-RTMPose-M cache and two-layer pose MLP. P1 appends pose and appearance as
-separate tokens; P2 adds gated projected pose to appearance before the scene
-transformer. Both tokens use the current foot-point position. DINOv3 remains
-shared and frozen. The RTMPose-M model is the rtmlib balanced COCO 17-joint
-model (192×256); the annotation box is passed directly to the top-down model.
-Its predicted image coordinates are normalized relative to the original box;
-coordinates can lie outside [0, 1], and each joint includes its confidence.
+OSL은 **CUCPS 학습 중에만** 보조 단서로 사용됩니다. 저장된 CUCPS 체크포인트로 검색할 때 히트맵 점수를 별도로 더하지는 않습니다.
 
-Install `rtmlib==0.0.16` and an ONNX Runtime backend in `flypose` for cache
-generation. The default CPU inference downloads the official model on first
-use. Each cache is resumable and keyed by sequence, frame, person, image path,
-image size, and box. A missing or mismatched record fails instead of silently
-substituting a pose. Cache files and model weights are generated artifacts.
-Generate both splits once, then reuse them for both variants:
+## 기존 체크포인트에 대한 주의
 
-```bash
-PY=/root/workplace/miniconda3/envs/flypose/bin/python
-$PY -m pip install rtmlib==0.0.16
-$PY cache_pose.py --config configs/e2c_p1.yaml --split train
-$PY cache_pose.py --config configs/e2c_p1.yaml --split val
-$PY run.py train --config configs/e2c_p1.yaml
-$PY run.py train --config configs/e2c_p2.yaml
-$PY run.py eval --config configs/e2c_p2.yaml --checkpoint outputs/annotations-e2c-p2/best.pt
-$PY run.py eval --config configs/e2c_p2.yaml --checkpoint outputs/annotations-e2c-p2/best.pt --shuffle-pose
-```
-
-Shuffling uses a fixed seed across the validation dataset, preserving each
-pose's joints and confidence together; compare against ordinary evaluation on
-the same checkpoint. Both configurations stop after eight epochs without
-improvement in overall validation argmax FDE, matching the existing checkpoint
-selection criterion. Metrics include movement thresholds, zero-motion FDE,
-improvement over zero-motion, and sequence breakdowns. The supplied split
-shares scenes between training and validation; configure separate sequence
-annotations and caches to measure unseen-scene generalization. Generating a
-cache and training full experiments are separate steps and may take time.
-
-## Historical PRW supervised calibration (not valid for the ID-free protocol)
-
-**Do not use this historical experiment for the current ID-free PRW protocol:**
-it trains and selects a scalar using PRW identity correspondences. The previously
-reported 93.151% result came from this supervised experiment. Use the official
-full-gallery section below instead.
-
-This experiment combines the official CUCPS detector and ReID embeddings with
-E2-C's future-position heatmap. The query is the annotated person box in the
-previous image; candidates are CUCPS detections in the next available PRW image
-from the same camera segment. Candidate scores are CUCPS's detection-weighted
-appearance score plus a learned nonnegative scalar times mean max-normalized E2-C
-heatmap probability around the candidate foot. No future ground-truth box or ID
-is used to compute either score. The query box is ground truth (an oracle): this
-is not yet a fully automatic video tracker or person-search system.
-
-**Supervision:** The official PRW CUCPS checkpoint was learned without person ID
-labels, but the scalar reranker here is **supervised**, using matching PRW person
-IDs for train/validation. The E2-C checkpoint was trained using same-person
-trajectory associations on PersonPath22. Therefore the complete pipeline should
-not be described as ID-free weakly supervised person search.
-
-The official CUCPS repository and the authors' PRW `args.json` and
-`checkpoint_epoch18.pth` are expected under `external/` as in
-`configs/temporal_prw.yaml`. CUCPS's official PRW pretrained checkpoint and
-instructions are available from https://github.com/VIP-Lab-UNIST/CUCPS_official.
-These external dependencies, generated datasets, and weights are not committed.
-
-From this directory, prepare the dataset once and run the stages in order:
-
-```bash
-PY=/root/workplace/miniconda3/envs/flypose/bin/python
-$PY prepare_prw_temporal.py --config configs/temporal_prw.yaml
-$PY temporal_search.py extract --config configs/temporal_prw.yaml --split train
-$PY temporal_search.py extract --config configs/temporal_prw.yaml --split val
-$PY temporal_search.py fit --config configs/temporal_prw.yaml
-$PY temporal_search.py extract --config configs/temporal_prw.yaml --split test
-$PY temporal_search.py evaluate --config configs/temporal_prw.yaml --split test
-```
-
-Set `CUDA_VISIBLE_DEVICES` to the selected available GPU before extraction.
-The YAML is the source of settings and paths; use a fresh `output_root` for a
-new run. Extraction writes one candidate record per query and refuses to
-overwrite existing output; interrupted output must be moved aside before a
-fresh extraction. `fit` selects an epoch on validation Rank-1 and MRR, with
-weight zero as an eligible baseline. Evaluation reports pre/post Rank-1, MRR,
-and candidate recall including queries for which the detector missed the true
-person. It also separates source frame gaps. These are next-frame matching
-metrics, not CUCPS's standard full-gallery mAP or Rank-1.
-
-Pairs use consecutive available PRW frames within the same camera segment and
-both endpoints in the same split. The official PRW train/test split is retained;
-PRW train frames are split chronologically within each camera segment into 80%
-train and 20% validation, with cross-boundary pairs excluded. Scenes and people
-can appear in both training and validation, and the pretrained CUCPS model has
-seen the PRW train set, including the reranker's validation frames. The official
-PRW test split is used only for final evaluation. Unknown IDs cannot be positive
-pairs. Instances whose person is absent in the next frame are not included, so
-this evaluates the conditional case only. Consecutive available PRW frames have
-variable original frame-number gaps and unknown elapsed time; the E2-C model was
-trained near one second. Compare performance by gap rather than interpreting
-all predictions as a fixed-time horizon. GT candidate mode is an oracle ablation
-(`cucps.candidate_mode: ground_truth`); it uses all valid PRW boxes as candidates
-and sets their detection scores to 1, so its results are not detector results.
-
-## PRW official full-gallery temporal experiment
-
-The next-frame Rank-1 experiment above does **not** reproduce official Person
-Search. For the full-gallery experiment, `official_gallery_search.py` uses the
-PRW official query list, all official test gallery images, and the CUCPS regular
-gallery protocol. For each official query, it adds the E2-C position score only
-to detections in the immediately next **available PRW frame** from the same
-camera and segment, when that frame is in the official test gallery. Other
-candidate scores are untouched. The next-frame mapping uses filenames only;
-future identity annotations do not decide whether to apply the score. Query
-boxes are official ground-truth query boxes.
-
-The inspected CUCPS checkout is pinned at
-`d6f1cf2d727300f655bbb871e6c45f5eaf4e45fb`. `compare` calls the original
-CUCPS PRW evaluator, independently evaluates the
-same unmodified scores, and stops if baseline mAP/Rank-1/Rank-5/Rank-10 do not
-match. It then reports reranked full-gallery metrics and frame-gap groups. The
-regular CUCPS script uses `det_thresh=0.9`, `ignore_cam_id=True` (same-camera
-images are included), and `remove_unlabel=True`. The last option uses PRW GT
-to remove detections that do not match a labeled person, so these results
-reproduce that GT-assisted benchmark protocol; they are not deployment metrics.
-
-The model score is `CUCPS score + weight * location score`. The nonnegative
-`fusion.weight` in `configs/official_gallery_prw.yaml` is specified **before**
-evaluation and is not trained or tuned with PRW identities, future boxes, or
-future locations. The example value `0.05` is illustrative, not an optimized or
-validated choice. The legacy `temporal_search.py fit` and its ranker outputs
-use PRW ID supervision and must not be used for this protocol. CUCPS uses its
-authors' pretrained PRW checkpoint; E2-C was trained separately on PersonPath22
-using person trajectory associations. PRW annotations are used by the official
-GT-assisted CUCPS evaluation protocol, not to fit future-location prediction or
-fusion weight. Actual time between PRW images is unknown.
-
-```bash
-PY=/root/workplace/miniconda3/envs/flypose/bin/python
-# From One_Second_Later. Choose the fixed fusion.weight before evaluating PRW.
-# Replace GPU_NUMBER with an available GPU index or UUID.
-CUDA_VISIBLE_DEVICES=GPU_NUMBER $PY -u official_gallery_search.py run --config configs/official_gallery_prw.yaml
-
-# Alternatively run the two stages separately:
-CUDA_VISIBLE_DEVICES=GPU_NUMBER $PY -u official_gallery_search.py extract --config configs/official_gallery_prw.yaml
-$PY -u official_gallery_search.py compare --config configs/official_gallery_prw.yaml
-```
-
-`extract` uses a GPU selected via `CUDA_VISIBLE_DEVICES`; comparison uses the
-CPU. All paths and settings are in the YAML; choose a fresh `output_root` for
-each run. Extraction writes `official_features.pkl` only after completing all
-images and queries; it does not resume a partially finished extraction. This
-file is a Python pickle and must only be loaded from a trusted local run.
-`run` reuses a completed feature cache if present; partial extraction cannot
-be resumed. `compare` writes original, baseline, reranked, per-query and gap-specific
-results to `official_gallery_metrics.json`. Baseline parity with the original
-official function is checked on every comparison, rather than assumed.
-
-## CUCPS temporal pseudo-ID clustering experiment
-
-`cucps_temporal_experiment.py` trains the official CUCPS PRW model twice from
-the same seed and settings. The baseline uses the original HNM/HPM behavior.
-The temporal run adds a fixed E2-C location score to the similarity used by
-HNM, before its per-image winner selection and cycle-consistency check. The
-score is added only when the candidate belongs to the next available training
-image in the same PRW camera segment; all other CUCPS image-pair similarities
-are unchanged. HPM continues to use CUCPS's co-appearance calculation.
-
-E2-C priors are computed from the previous frame image and its annotated person
-box, and scored at each candidate box's bottom center in the next frame. Prior
-construction reads boxes and frame names only; it does not read PRW identity
-labels. CUCPS continues to build its own pseudo IDs from its per-instance
-memory and HNM/HPM. The motion checkpoint is the existing PersonPath22-trained
-E2-C model. The fixed `temporal_prior.weight: 0.05` is not fitted on PRW.
-Consecutive available PRW images can have different frame-number gaps, so the
-time horizon is not constant. The current PRW train list has a median gap of 50
-frame numbers, a 90th-percentile gap of 375, and a maximum gap of 3,900; the
-runner records the actual gap summary for each run. The experiment follows the
-requested next-available-frame rule even for large gaps, so E2-C's prior may be
-less reliable for those pairs.
-
-Training uses the official `train-prw.sh` settings in the YAML. Each run gets a
-new timestamped directory under `../PRW_cucps_temporal/runs/{baseline,temporal}`
-and prints its checkpoint path. Temporal heatmaps are cached outside this
-repository in `../PRW_cucps_temporal/cache/`. The cache contains no identity
-labels. Both checkpoints can be evaluated with CUCPS's official regular PRW
-full-gallery evaluator (`det_thresh=0.9`, `ignore_cam_id=True`,
-`remove_unlabel=True`), then compared with the `compare` action. As with the
-official CUCPS protocol, `remove_unlabel=True` uses PRW test annotations during
-evaluation; this is benchmark evaluation, not training supervision.
-
-Run the baseline first, then the temporal variant on the same selected GPU.
-Run these commands directly in a terminal; training logs remain visible there.
-
-```bash
-cd /root/workplace/assignment/principle_of_deeplearning/One_Second_Later
-PY=/root/workplace/miniconda3/envs/flypose/bin/python
-CUDA_VISIBLE_DEVICES=0 $PY -u cucps_temporal_experiment.py train --config configs/cucps_temporal_prw.yaml --variant baseline
-```
-
-After the baseline finishes, start the temporal run:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 $PY -u cucps_temporal_experiment.py train --config configs/cucps_temporal_prw.yaml --variant temporal
-```
-
-Copy each printed run directory into the evaluation commands below, replacing
-`RUN_DIR` with its absolute path. Evaluate both final checkpoints and compare
-the resulting official metrics:
-
-```bash
-$PY cucps_temporal_experiment.py test --config configs/cucps_temporal_prw.yaml --checkpoint RUN_DIR/checkpoint_epoch_last.pth
-$PY cucps_temporal_experiment.py compare \
-  --baseline-checkpoint BASELINE_RUN_DIR/checkpoint_epoch_last.pth \
-  --temporal-checkpoint TEMPORAL_RUN_DIR/checkpoint_epoch_last.pth \
-  --output ../PRW_cucps_temporal/comparison.json
-```
-
-The comparison reports mAP and Rank-1 changes in percentage points. Do not
-compare this result to the earlier post-search reranking experiment as though
-the clustering stage were unchanged: this experiment trains CUCPS with the
-temporal prior inside HNM.
-
-### Temporal graph positive propagation
-
-The separate `graph` variant keeps the original CUCPS HNM/HPM result, then
-extends it through an undirected temporal graph before ReID loss. It does not
-change inference. Each edge combines the current memory cosine similarity and
-the frozen predictor's cached next-frame location score. Edges require mutual
-best matches, appearance and combined thresholds, and a top-two margin in
-both directions. The cache rejects pairs beyond `max_frame_gap` and predictions
-whose softmax heatmap peak is below `min_heatmap_peak`. These are frame-number
-and concentration filters, not calibrated time or prediction confidence.
-
-After CUCPS warm-up, the graph is rebuilt on every clustering call using current
-memory features. CUCPS mining is also run for temporal neighbors of the batch;
-maximum products of edge confidences and `alpha` expand both ends of each
-positive relation up to `hops` per side. Original batch positives are retained;
-new candidates must meet path and appearance thresholds and cannot occupy a
-scene already represented in the original or newly accepted positives. The
-implementation uses sparse adjacency lists; it does not form an N-by-N graph.
-The extra mining and graph construction add training cost. Thresholds in the
-example YAML are illustrative and are not validated performance claims.
-
-```bash
-PY=/root/workplace/miniconda3/envs/flypose/bin/python
-CUDA_VISIBLE_DEVICES=0 $PY -u cucps_temporal_experiment.py train --config configs/cucps_temporal_graph_prw.yaml --variant graph
-```
-
-Choose a GPU and thresholds before running, and use a separate cache when
-changing predictor, heatmap, or graph-cache settings. The cache contains box
-locations and frame metadata, not PRW identity labels. The predictor was trained
-on PersonPath22 trajectories, so it adds external trajectory supervision.
-PRW frame-number gaps are not a verified time interval; check the predictor's
-one-second horizon against the data before interpreting results. Compare with a
-same-seed baseline and measure cross-camera positive precision/recall and
-negative contamination separately; the current evaluator does not compute
-those diagnostic metrics or an oracle graph.
+이전 PRW 실험에서 사용한 `outputs/pose-runs/20261123-0228/p2/best.pt`에는 학습 데이터가 `../MOT17_prediction`으로 기록돼 있습니다. 따라서 이 체크포인트를 PersonPath22에서 학습한 OSL로 간주하면 안 됩니다. `configs/cucps_temporal_prw_pose_p2.yaml`은 기본적으로 이 기존 체크포인트를 가리킵니다. PersonPath22에서 학습한 OSL을 쓰려면 위처럼 `motion.pose_checkpoint`를 변경해야 합니다.
