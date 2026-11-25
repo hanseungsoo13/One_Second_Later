@@ -47,7 +47,8 @@ class ModernMemoryLayer(torch.autograd.Function):
                 memory[target] /= memory[target].norm()
         return grad_inputs, None, None, None
 
-from osl.cucps_temporal import add_temporal_prior, next_frame_indices
+from osl.cucps_temporal import (add_temporal_prior, next_frame_indices,
+                                build_temporal_graph, refine_temporal_positives)
 from osl.model import DinoBackbone, Model
 from osl.pose import relative_pose
 from osl.temporal_search import location_scores
@@ -252,6 +253,9 @@ def _cache_metadata(cfg, paths, dataset, variant='temporal'):
         'person_crop': motion_cfg['person_crop'],
         'heatmap_radius_cells': motion_cfg['heatmap_radius_cells'],
     }
+    if variant == 'graph':
+        metadata['graph_cache'] = {'max_frame_gap': cfg['temporal_graph']['max_frame_gap'],
+                                   'min_heatmap_peak': cfg['temporal_graph']['min_heatmap_peak']}
     if variant.startswith('pose_'):
         pose_checkpoint = paths[('motion', 'pose_checkpoint')]
         pose_stat = pose_checkpoint.stat()
@@ -328,6 +332,10 @@ def prepare_temporal_prior(cfg, dataset, device, paths, variant='temporal'):
 
     for source_index, next_index in next_indices.items():
         source_record, next_record = records[source_index], records[next_index]
+        if variant == 'graph':
+            gap = int(next_record['im_name'].rsplit('_', 1)[1][:-4]) - int(source_record['im_name'].rsplit('_', 1)[1][:-4])
+            if gap > int(cfg['temporal_graph']['max_frame_gap']):
+                continue
         source_boxes = np.asarray(source_record['boxes'], dtype=np.float32).reshape(-1, 4)
         next_boxes = np.asarray(next_record['boxes'], dtype=np.float32).reshape(-1, 4)
         source_memory_ids = np.asarray(source_record['cnt'], dtype=np.int64).reshape(-1) - 1
@@ -359,11 +367,15 @@ def prepare_temporal_prior(cfg, dataset, device, paths, variant='temporal'):
                 logits = model(images, boxes, crops, pose_chunk)
             heatmaps = logits.float().flatten(1).softmax(1).reshape(logits.shape[0], *logits.shape[-2:]).cpu().numpy()
             for local_index, heatmap in enumerate(heatmaps):
+                if variant == 'graph' and heatmap.max() < float(cfg['temporal_graph']['min_heatmap_peak']):
+                    continue
                 candidate_scores[start + local_index] = location_scores(
                     heatmap, next_boxes, scale, offset, output_size, radius
                 )
 
         for source_id, scores in zip(source_memory_ids, candidate_scores):
+            if variant == 'graph' and not len(scores):
+                continue
             if source_id < 0 or source_id >= num_instances:
                 raise ValueError('PRW instance index is outside the CUCPS feature memory')
             prior_rows[int(source_id)] = (next_memory_ids.copy(), np.asarray(scores, dtype=np.float32))
@@ -394,6 +406,23 @@ def _attach_temporal_prior(clustering, prior_rows, weight):
     clustering.hard_negative_mining = MethodType(temporal_hnm, clustering)
 
 
+def _attach_temporal_graph(clustering, prior_rows, cfg):
+    original = clustering.predict
+
+    def graph_predict(self, memory, targets):
+        graph = build_temporal_graph(
+            prior_rows, memory, float(cfg['location_weight']),
+            float(cfg['min_edge_appearance']), float(cfg['min_edge_combined']),
+            float(cfg['min_edge_margin']))
+        return refine_temporal_positives(
+            memory, targets, graph, self.cnt2snum, original,
+            hops=int(cfg['hops']), alpha=float(cfg['alpha']),
+            min_confidence=float(cfg['min_path_confidence']),
+            min_appearance=float(cfg['min_positive_appearance']))
+
+    clustering.predict = MethodType(graph_predict, clustering)
+
+
 def _resolve_device(value):
     """Resolve CUDA's implicit device to the first visible GPU."""
     device = torch.device(value)
@@ -412,8 +441,8 @@ def _exclusive_epoch_end(epochs, start_epoch=1):
 
 
 def train(cfg, variant):
-    if variant not in ('baseline', 'temporal', 'pose_p1', 'pose_p2'):
-        raise ValueError('variant must be baseline, temporal, pose_p1, or pose_p2')
+    if variant not in ('baseline', 'temporal', 'pose_p1', 'pose_p2', 'graph'):
+        raise ValueError('variant must be baseline, temporal, pose_p1, pose_p2, or graph')
     datasets, get_model, paths = _load_cucps(cfg)
     from configs import args_faster_rcnn
     from lib.utils.misc import Nestedspace, get_lr_scheduler, get_optimizer
@@ -466,8 +495,11 @@ def train(cfg, variant):
         expected = model.roi_heads.reid_regressor.clustering.cnt2snum.numel()
         if len(prior_rows) != expected:
             raise ValueError(f'Temporal-prior rows ({len(prior_rows)}) do not match CUCPS memory ({expected})')
-        _attach_temporal_prior(model.roi_heads.reid_regressor.clustering, prior_rows,
-                               float(cfg['temporal_prior']['weight']))
+        if variant == 'graph':
+            _attach_temporal_graph(model.roi_heads.reid_regressor.clustering, prior_rows, cfg['temporal_graph'])
+        else:
+            _attach_temporal_prior(model.roi_heads.reid_regressor.clustering, prior_rows,
+                                   float(cfg['temporal_prior']['weight']))
     model.to(device)
     optimizer = get_optimizer(args, model)
     scheduler = get_lr_scheduler(args, optimizer)
@@ -478,9 +510,10 @@ def train(cfg, variant):
     args.export_to_json(str(run_dir / 'args.json'))
     metadata = {
         'variant': variant,
+        'temporal_graph': cfg.get('temporal_graph') if variant == 'graph' else None,
         'requested_epochs': int(training['epochs']),
         'trainer_epoch_end_exclusive': int(args.train.epochs),
-        'temporal_weight': float(cfg['temporal_prior']['weight']) if variant != 'baseline' else 0.0,
+        'temporal_weight': float(cfg['temporal_prior']['weight']) if variant not in ('baseline', 'graph') else 0.0,
         'temporal_prior_cache': str(paths[('temporal_prior', 'cache')]) if variant != 'baseline' else None,
         'motion_checkpoint': str(paths[('motion', 'checkpoint')]) if variant != 'baseline' else None,
         'pose_checkpoint': str(paths[('motion', 'pose_checkpoint')]) if variant.startswith('pose_') else None,
@@ -565,7 +598,7 @@ def main():
         sub = subparsers.add_parser(action)
         sub.add_argument('--config', required=True)
         if action == 'train':
-            sub.add_argument('--variant', required=True, choices=('baseline', 'temporal', 'pose_p1', 'pose_p2'))
+            sub.add_argument('--variant', required=True, choices=('baseline', 'temporal', 'pose_p1', 'pose_p2', 'graph'))
         else:
             sub.add_argument('--checkpoint', required=True)
     sub = subparsers.add_parser('compare')

@@ -271,3 +271,39 @@ The comparison reports mAP and Rank-1 changes in percentage points. Do not
 compare this result to the earlier post-search reranking experiment as though
 the clustering stage were unchanged: this experiment trains CUCPS with the
 temporal prior inside HNM.
+
+### Temporal graph positive propagation
+
+The separate `graph` variant keeps the original CUCPS HNM/HPM result, then
+extends it through an undirected temporal graph before ReID loss. It does not
+change inference. Each edge combines the current memory cosine similarity and
+the frozen predictor's cached next-frame location score. Edges require mutual
+best matches, appearance and combined thresholds, and a top-two margin in
+both directions. The cache rejects pairs beyond `max_frame_gap` and predictions
+whose softmax heatmap peak is below `min_heatmap_peak`. These are frame-number
+and concentration filters, not calibrated time or prediction confidence.
+
+After CUCPS warm-up, the graph is rebuilt on every clustering call using current
+memory features. CUCPS mining is also run for temporal neighbors of the batch;
+maximum products of edge confidences and `alpha` expand both ends of each
+positive relation up to `hops` per side. Original batch positives are retained;
+new candidates must meet path and appearance thresholds and cannot occupy a
+scene already represented in the original or newly accepted positives. The
+implementation uses sparse adjacency lists; it does not form an N-by-N graph.
+The extra mining and graph construction add training cost. Thresholds in the
+example YAML are illustrative and are not validated performance claims.
+
+```bash
+PY=/root/workplace/miniconda3/envs/flypose/bin/python
+CUDA_VISIBLE_DEVICES=0 $PY -u cucps_temporal_experiment.py train --config configs/cucps_temporal_graph_prw.yaml --variant graph
+```
+
+Choose a GPU and thresholds before running, and use a separate cache when
+changing predictor, heatmap, or graph-cache settings. The cache contains box
+locations and frame metadata, not PRW identity labels. The predictor was trained
+on PersonPath22 trajectories, so it adds external trajectory supervision.
+PRW frame-number gaps are not a verified time interval; check the predictor's
+one-second horizon against the data before interpreting results. Compare with a
+same-seed baseline and measure cross-camera positive precision/recall and
+negative contamination separately; the current evaluator does not compute
+those diagnostic metrics or an oracle graph.
