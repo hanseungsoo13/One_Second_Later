@@ -121,6 +121,14 @@ python scripts/cucps/evaluate.py --config configs/cucps/prw_pose2.yaml \
   --checkpoint /path/to/cucps/checkpoint.pth
 ```
 
+Temporal graph 설정도 같은 평가 진입점을 사용합니다. 메인 `One_Second_Later` 저장소 루트에서 실행하면 `external/CUCPS_official` 경로가 올바르게 해석됩니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python scripts/cucps/evaluate.py \
+  --config configs/cucps_temporal_graph_prw.yaml \
+  --checkpoint ../PRW_cucps_temporal/runs/graph/20261125_044605/checkpoint_epoch24.pth
+```
+
 기준 모델과 OSL을 사용한 모델을 각각 평가한 뒤 아래 결과 비교 명령을 사용합니다.
 
 ## 기존 체크포인트에 대한 주의
