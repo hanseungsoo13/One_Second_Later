@@ -1,0 +1,39 @@
+prw:
+  root: /root/dataset/PersonSearch/PRW-v16.04.20
+cucps:
+  repo: external/CUCPS_official
+temporal_prior:
+  weight: 0.05
+  cache: ../PRW_cucps_temporal_pose/cache/prw_train_personpath_osl_s_run01.npz
+motion:
+  repo: external/dinov3
+  weights: /root/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  name: dinov3_vitb16
+  checkpoint: outputs/personpath22-ground-view-e2c-20261119-01/best.pt
+  pose_checkpoint: ../One_Second_Later-p2-seg/outputs/personpath22-osl-s/run-01/best.pt
+  size: [384, 640]
+  batch_size: 4
+  heatmap_radius_cells: 1
+  person_crop:
+    size: [224, 224]
+    scale: 2.0
+  pose:
+    model: https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip
+    input_size: [192, 256]
+    backend: onnxruntime
+    device: cuda
+  semantic:
+    model: nvidia/segformer-b2-finetuned-ade-512-512
+    revision: de01bae28967510f9ddd496c60a969357195400c
+    device: cuda
+training:
+  num_pids: 482
+  num_cq_size: 500
+  lr_decay_step: 14
+  batch_size: 4
+  workers: 4
+  seed: 0
+  epochs: 25
+  output_root: ../PRW_cucps_temporal_pose/runs_personpath_osl_s
+runtime:
+  device: cuda
