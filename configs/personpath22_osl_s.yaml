@@ -74,7 +74,7 @@ data:
   - 384
   - 640
 model:
-  variant: e2c_p2_s
+  variant: full_bbox_pose_seg
   person_crop:
     size:
     - 224
@@ -91,7 +91,7 @@ model:
   semantic:
     model: nvidia/segformer-b2-finetuned-ade-512-512
     revision: de01bae28967510f9ddd496c60a969357195400c
-    cache: outputs/personpath22-osl-s/semantic-cache/ade20k.sqlite
+    cache: ../One_Second_Later-p2-seg/outputs/personpath22-osl-s/semantic-cache/ade20k.sqlite
     device: cuda
 training:
   seed: 42
@@ -103,7 +103,7 @@ training:
   weight_decay: 0.01
   warmup_epochs: 3
   sigma: 2.5
-  output: outputs/personpath22-osl-s/run-01
+  output: outputs/personpath22-osl-s/run-refactor-20261125-01
 wandb:
   enabled: false
   mode: offline
